@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
@@ -17,6 +19,69 @@ namespace USBPortControllerApp
         Arabic,
         English
     }
+
+    #region Security Activity Logger
+    public static class SecurityLogger
+    {
+        private static readonly string LogFilePath;
+
+        static SecurityLogger()
+        {
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "USBPortControllerShield");
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                LogFilePath = Path.Combine(dir, "security_events.log");
+            }
+            catch
+            {
+                LogFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "security_events.log");
+            }
+        }
+
+        public static void LogEvent(string eventType, string details)
+        {
+            try
+            {
+                string line = string.Format("[{0:yyyy-MM-dd HH:mm:ss}] [{1}] {2}", DateTime.Now, eventType, details);
+                File.AppendAllText(LogFilePath, line + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        public static string[] ReadRecentLogs(int maxLines = 100)
+        {
+            try
+            {
+                if (File.Exists(LogFilePath))
+                {
+                    string[] lines = File.ReadAllLines(LogFilePath, Encoding.UTF8);
+                    if (lines.Length <= maxLines) return lines;
+                    string[] recent = new string[maxLines];
+                    Array.Copy(lines, lines.Length - maxLines, recent, 0, maxLines);
+                    return recent;
+                }
+            }
+            catch { }
+            return new string[0];
+        }
+
+        public static void ClearLogs()
+        {
+            try
+            {
+                if (File.Exists(LogFilePath)) File.Delete(LogFilePath);
+                LogEvent("LOGS_CLEARED", Loc.T("تم مسح السجلات الأمنية بواسطة المسؤول", "Security logs cleared by Administrator"));
+            }
+            catch { }
+        }
+
+        public static string GetLogPath()
+        {
+            return LogFilePath;
+        }
+    }
+    #endregion
 
     #region Localization Manager
     public static class Loc
@@ -81,6 +146,121 @@ namespace USBPortControllerApp
         public static string T(string ar, string en)
         {
             return IsArabic ? ar : en;
+        }
+    }
+    #endregion
+
+    #region Auto-Lock Timer Manager
+    public static class AutoLockTimerManager
+    {
+        private static System.Windows.Forms.Timer countdownTimer;
+        private static int remainingSeconds = 0;
+        public static Action<int> OnTick;
+        public static Action OnExpired;
+
+        public static bool IsTimerRunning
+        {
+            get { return remainingSeconds > 0; }
+        }
+
+        public static int RemainingSeconds
+        {
+            get { return remainingSeconds; }
+        }
+
+        public static void StartTimer(int minutes, Action onExpiredCallback)
+        {
+            StopTimer();
+            remainingSeconds = minutes * 60;
+            OnExpired = onExpiredCallback;
+
+            countdownTimer = new System.Windows.Forms.Timer();
+            countdownTimer.Interval = 1000;
+            countdownTimer.Tick += (s, e) =>
+            {
+                remainingSeconds--;
+                if (OnTick != null) OnTick(remainingSeconds);
+
+                if (remainingSeconds <= 0)
+                {
+                    StopTimer();
+                    if (OnExpired != null) OnExpired();
+                }
+            };
+            countdownTimer.Start();
+            SecurityLogger.LogEvent("TIMER_STARTED", Loc.T("تم تفعيل مؤقت الفتح المؤقت لمدة " + minutes + " دقيقة", "Temporary unlock timer started for " + minutes + " mins"));
+        }
+
+        public static void StopTimer()
+        {
+            if (countdownTimer != null)
+            {
+                countdownTimer.Stop();
+                countdownTimer.Dispose();
+                countdownTimer = null;
+            }
+            remainingSeconds = 0;
+        }
+    }
+    #endregion
+
+    #region Webhook & Telegram Alerts Manager
+    public static class AlertNotifier
+    {
+        private const string RegKeyPath = @"Software\USBPortController\Alerts";
+
+        public static void SendTelegramAlert(string botToken, string chatId, string message)
+        {
+            if (string.IsNullOrEmpty(botToken) || string.IsNullOrEmpty(chatId)) return;
+            new Thread(() =>
+            {
+                try
+                {
+                    string url = string.Format("https://api.telegram.org/bot{0}/sendMessage?chat_id={1}&text={2}",
+                        Uri.EscapeDataString(botToken),
+                        Uri.EscapeDataString(chatId),
+                        Uri.EscapeDataString(message));
+                    using (WebClient client = new WebClient())
+                    {
+                        client.DownloadString(url);
+                    }
+                }
+                catch { }
+            }).Start();
+        }
+
+        public static void SaveTelegramConfig(string botToken, string chatId)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKeyPath))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("BotToken", botToken, RegistryValueKind.String);
+                        key.SetValue("ChatId", chatId, RegistryValueKind.String);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void LoadTelegramConfig(out string botToken, out string chatId)
+        {
+            botToken = "";
+            chatId = "";
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKeyPath))
+                {
+                    if (key != null)
+                    {
+                        botToken = key.GetValue("BotToken") as string ?? "";
+                        chatId = key.GetValue("ChatId") as string ?? "";
+                    }
+                }
+            }
+            catch { }
         }
     }
     #endregion
@@ -246,6 +426,7 @@ namespace USBPortControllerApp
                     {
                         key.SetValue(HashValueName, hash, RegistryValueKind.String);
                         key.SetValue(SaltValueName, salt, RegistryValueKind.String);
+                        SecurityLogger.LogEvent("PASS_SET", Loc.T("تم تحديث كلمة السر الرئيسية بنجاح", "Master password configured successfully"));
                         return true;
                     }
                 }
@@ -275,7 +456,16 @@ namespace USBPortControllerApp
                         if (!string.IsNullOrEmpty(storedHash) && !string.IsNullOrEmpty(storedSalt))
                         {
                             string calculatedHash = ComputeHash(inputPassword, storedSalt);
-                            return storedHash == calculatedHash;
+                            bool match = storedHash == calculatedHash;
+                            if (match)
+                            {
+                                SecurityLogger.LogEvent("AUTH_SUCCESS", Loc.T("تم تسجيل الدخول بنجاح", "Successful authentication"));
+                            }
+                            else
+                            {
+                                SecurityLogger.LogEvent("AUTH_FAILED", Loc.T("محاولة دخول فاشلة بكلمة سر خاطئة!", "Failed authentication attempt!"));
+                            }
+                            return match;
                         }
                     }
                 }
@@ -308,7 +498,10 @@ namespace USBPortControllerApp
             Unlock,
             SetupPassword,
             Control,
-            ChangePassword
+            ChangePassword,
+            ActivityLogs,
+            AutoLockTimer,
+            TelegramSettings
         }
 
         private CurrentViewType activeView = CurrentViewType.Unlock;
@@ -316,7 +509,7 @@ namespace USBPortControllerApp
         private Panel contentCard;
         private Image logoImage;
 
-        // عناصر واجهة التحكم
+        // UI Controls
         private Label lblUsbStatus;
         private Button btnToggleUsb;
         private Label lblWriteProtectStatus;
@@ -324,6 +517,7 @@ namespace USBPortControllerApp
         private Label lblAutoStartStatus;
         private Button btnToggleAutoStart;
         private Label lblLiveIndicator;
+        private Label lblTimerStatus;
         private NotifyIcon trayIcon;
 
         public UnifiedMainForm(bool startInBackground = false)
@@ -333,6 +527,20 @@ namespace USBPortControllerApp
 
             InitCardContainer();
             InitTrayIcon();
+
+            AutoLockTimerManager.OnTick = (sec) =>
+            {
+                if (lblTimerStatus != null && !lblTimerStatus.IsDisposed)
+                {
+                    int m = sec / 60;
+                    int s = sec % 60;
+                    lblTimerStatus.Text = Loc.T(
+                        string.Format("⏳ المؤقت: يغلق تلقائياً بعد {0:D2}:{1:D2}", m, s),
+                        string.Format("⏳ Timer: Auto-locking in {0:D2}:{1:D2}", m, s)
+                    );
+                    lblTimerStatus.ForeColor = Color.FromArgb(251, 191, 36);
+                }
+            };
 
             if (!PasswordManager.IsPasswordSet())
             {
@@ -376,8 +584,8 @@ namespace USBPortControllerApp
 
         private void ApplyFormStyling()
         {
-            this.Text = Loc.T("درع التحكم في منافذ USB", "USB Port Controller Shield");
-            this.Size = new Size(480, 440);
+            this.Text = Loc.T("درع التحكم في منافذ USB (الإصدار المؤسسي)", "USB Port Controller Shield (Enterprise v2.0)");
+            this.Size = new Size(500, 510);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
@@ -411,10 +619,10 @@ namespace USBPortControllerApp
         {
             contentCard = new Panel
             {
-                Location = new Point(18, 15),
-                Size = new Size(428, 370),
+                Location = new Point(18, 12),
+                Size = new Size(448, 445),
                 BackColor = Color.FromArgb(30, 41, 59),
-                Padding = new Padding(15)
+                Padding = new Padding(12)
             };
             this.Controls.Add(contentCard);
         }
@@ -437,6 +645,15 @@ namespace USBPortControllerApp
                     break;
                 case CurrentViewType.ChangePassword:
                     ShowChangePasswordView();
+                    break;
+                case CurrentViewType.ActivityLogs:
+                    ShowActivityLogsView();
+                    break;
+                case CurrentViewType.AutoLockTimer:
+                    ShowAutoLockTimerView();
+                    break;
+                case CurrentViewType.TelegramSettings:
+                    ShowTelegramSettingsView();
                     break;
             }
 
@@ -490,6 +707,7 @@ namespace USBPortControllerApp
 
         private void ExitApplication()
         {
+            SecurityLogger.LogEvent("APP_EXIT", Loc.T("تم إيقاف خدمة الحماية والخروج من التطبيق", "Protection service stopped and app exited"));
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;
@@ -503,7 +721,7 @@ namespace USBPortControllerApp
             Button btnLang = new Button
             {
                 Text = Loc.IsArabic ? "🌐 English" : "🌐 العربية",
-                Size = new Size(95, 26),
+                Size = new Size(90, 26),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 FlatStyle = FlatStyle.Flat,
@@ -526,26 +744,21 @@ namespace USBPortControllerApp
                 SizeMode = PictureBoxSizeMode.Zoom,
                 BackColor = Color.Transparent
             };
-            if (logoImage != null)
-            {
-                pic.Image = logoImage;
-            }
+            if (logoImage != null) pic.Image = logoImage;
             return pic;
         }
 
-        #region View 1: شاشة إدخال كلمة السر لفتح القفل
+        #region View 1: شاشة فتح القفل
         private void ShowUnlockView()
         {
             activeView = CurrentViewType.Unlock;
             contentCard.Controls.Clear();
 
-            // زر اللغة
             Button btnLang = CreateLangSwitchButton();
-            btnLang.Location = Loc.IsArabic ? new Point(15, 12) : new Point(318, 12);
+            btnLang.Location = Loc.IsArabic ? new Point(15, 12) : new Point(340, 12);
 
-            // صورة الشعار
             PictureBox picLogo = CreateLogoHeader(48);
-            picLogo.Location = Loc.IsArabic ? new Point(365, 10) : new Point(15, 10);
+            picLogo.Location = Loc.IsArabic ? new Point(380, 10) : new Point(15, 10);
 
             Label lblTitle = new Label
             {
@@ -553,7 +766,7 @@ namespace USBPortControllerApp
                 ForeColor = Color.FromArgb(96, 165, 250),
                 Font = new Font("Segoe UI", 12F, FontStyle.Bold),
                 Location = Loc.IsArabic ? new Point(115, 15) : new Point(70, 15),
-                Size = new Size(245, 28),
+                Size = new Size(260, 28),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
@@ -562,15 +775,15 @@ namespace USBPortControllerApp
                 Text = Loc.T("أدخل كلمة السر الرئيسية للوصول للتحكم بمنافذ USB:", "Enter master password to access USB port controls:"),
                 ForeColor = Color.FromArgb(148, 163, 184),
                 Font = new Font("Segoe UI", 9F),
-                Location = new Point(15, 70),
-                Size = new Size(398, 24),
+                Location = new Point(15, 75),
+                Size = new Size(418, 24),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             TextBox txtPassword = new TextBox
             {
-                Location = new Point(15, 100),
-                Size = new Size(398, 30),
+                Location = new Point(15, 110),
+                Size = new Size(418, 30),
                 PasswordChar = '●',
                 BackColor = Color.FromArgb(15, 23, 42),
                 ForeColor = Color.White,
@@ -583,16 +796,16 @@ namespace USBPortControllerApp
                 Text = "",
                 ForeColor = Color.FromArgb(248, 113, 113),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(15, 145),
-                Size = new Size(398, 22),
+                Location = new Point(15, 155),
+                Size = new Size(418, 22),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             Button btnUnlock = new Button
             {
                 Text = Loc.T("فتح القفل 🔓", "Unlock 🔓"),
-                Location = new Point(15, 185),
-                Size = new Size(398, 45),
+                Location = new Point(15, 195),
+                Size = new Size(418, 45),
                 BackColor = Color.FromArgb(16, 185, 129),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -604,8 +817,8 @@ namespace USBPortControllerApp
             Button btnExit = new Button
             {
                 Text = Loc.T("خروج", "Exit"),
-                Location = new Point(15, 245),
-                Size = new Size(398, 38),
+                Location = new Point(15, 255),
+                Size = new Size(418, 38),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 FlatStyle = FlatStyle.Flat,
@@ -626,6 +839,13 @@ namespace USBPortControllerApp
                     lblError.Text = Loc.T("⚠ كلمة السر غير صحيحة! حاول مجدداً.", "⚠ Incorrect password! Please try again.");
                     txtPassword.SelectAll();
                     txtPassword.Focus();
+
+                    string botToken, chatId;
+                    AlertNotifier.LoadTelegramConfig(out botToken, out chatId);
+                    if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
+                    {
+                        AlertNotifier.SendTelegramAlert(botToken, chatId, "⚠️ تنبيه أمني: محاولة دخول فاشلة بكلمة سر غير صحيحة على جهاز: " + Environment.MachineName);
+                    }
                 }
             };
 
@@ -643,17 +863,17 @@ namespace USBPortControllerApp
         }
         #endregion
 
-        #region View 2: شاشة إعداد كلمة السر لأول مرة
+        #region View 2: إعداد كلمة السر لأول مرة
         private void ShowSetupPasswordView()
         {
             activeView = CurrentViewType.SetupPassword;
             contentCard.Controls.Clear();
 
             Button btnLang = CreateLangSwitchButton();
-            btnLang.Location = Loc.IsArabic ? new Point(15, 10) : new Point(318, 10);
+            btnLang.Location = Loc.IsArabic ? new Point(15, 10) : new Point(340, 10);
 
             PictureBox picLogo = CreateLogoHeader(42);
-            picLogo.Location = Loc.IsArabic ? new Point(370, 8) : new Point(15, 8);
+            picLogo.Location = Loc.IsArabic ? new Point(385, 8) : new Point(15, 8);
 
             Label lblTitle = new Label
             {
@@ -661,7 +881,7 @@ namespace USBPortControllerApp
                 ForeColor = Color.FromArgb(96, 165, 250),
                 Font = new Font("Segoe UI", 11.5F, FontStyle.Bold),
                 Location = Loc.IsArabic ? new Point(115, 12) : new Point(65, 12),
-                Size = new Size(250, 26),
+                Size = new Size(260, 26),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
@@ -669,37 +889,37 @@ namespace USBPortControllerApp
             {
                 Text = Loc.T("كلمة السر الجديدة:", "New Password:"),
                 ForeColor = Color.FromArgb(226, 232, 240),
-                Location = new Point(15, 55),
-                Size = new Size(398, 20),
+                Location = new Point(15, 60),
+                Size = new Size(418, 20),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
-            TextBox txtNew = new TextBox { Location = new Point(15, 80), Size = new Size(398, 26), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+            TextBox txtNew = new TextBox { Location = new Point(15, 85), Size = new Size(418, 26), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
 
             Label lblConf = new Label
             {
                 Text = Loc.T("تأكيد كلمة السر:", "Confirm Password:"),
                 ForeColor = Color.FromArgb(226, 232, 240),
-                Location = new Point(15, 120),
-                Size = new Size(398, 20),
+                Location = new Point(15, 125),
+                Size = new Size(418, 20),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
-            TextBox txtConf = new TextBox { Location = new Point(15, 145), Size = new Size(398, 26), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+            TextBox txtConf = new TextBox { Location = new Point(15, 150), Size = new Size(418, 26), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
 
             Label lblErr = new Label
             {
                 Text = "",
                 ForeColor = Color.FromArgb(248, 113, 113),
                 Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
-                Location = new Point(15, 180),
-                Size = new Size(398, 20),
+                Location = new Point(15, 185),
+                Size = new Size(418, 20),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             Button btnSave = new Button
             {
                 Text = Loc.T("حفظ ومتابعة ✔", "Save & Continue ✔"),
-                Location = new Point(15, 210),
-                Size = new Size(398, 42),
+                Location = new Point(15, 215),
+                Size = new Size(418, 42),
                 BackColor = Color.FromArgb(37, 99, 235),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -746,74 +966,117 @@ namespace USBPortControllerApp
         }
         #endregion
 
-        #region View 3: شاشة التحكم في المنافذ والخدمة المستمرة
+        #region View 3: لوحة التحكم الرئيسية الكاملة
         private void ShowControlView()
         {
             activeView = CurrentViewType.Control;
             contentCard.Controls.Clear();
 
-            // صورة الشعار
-            PictureBox picLogo = CreateLogoHeader(34);
-            picLogo.Location = Loc.IsArabic ? new Point(380, 8) : new Point(15, 8);
+            // 1. الشريط العلوي
+            PictureBox picLogo = CreateLogoHeader(30);
+            picLogo.Location = Loc.IsArabic ? new Point(400, 6) : new Point(12, 6);
 
             Label lblTitle = new Label
             {
-                Text = Loc.T("🛡️ درع منافذ USB", "🛡️ USB Shield"),
+                Text = Loc.T("🛡️ درع USB", "🛡️ Shield"),
                 ForeColor = Color.FromArgb(96, 165, 250),
-                Font = new Font("Segoe UI", 11F, FontStyle.Bold),
-                Location = Loc.IsArabic ? new Point(230, 10) : new Point(55, 10),
-                Size = new Size(145, 26),
+                Font = new Font("Segoe UI", 10.5F, FontStyle.Bold),
+                Location = Loc.IsArabic ? new Point(290, 8) : new Point(45, 8),
+                Size = new Size(105, 24),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
+            // أزرار شريط الأدوات العلوية السريعة
             Button btnLang = CreateLangSwitchButton();
-            btnLang.Size = new Size(80, 26);
-            btnLang.Location = Loc.IsArabic ? new Point(145, 8) : new Point(205, 8);
+            btnLang.Size = new Size(65, 24);
+            btnLang.Font = new Font("Segoe UI", 8F, FontStyle.Bold);
+            btnLang.Location = Loc.IsArabic ? new Point(220, 7) : new Point(155, 7);
 
-            Button btnChangePass = new Button
+            Button btnLogs = new Button
             {
-                Text = Loc.T("🔑 رمز", "🔑 Pass"),
-                Size = new Size(60, 26),
-                Location = Loc.IsArabic ? new Point(80, 8) : new Point(290, 8),
+                Text = Loc.T("📋 السجل", "📋 Logs"),
+                Size = new Size(65, 24),
+                Location = Loc.IsArabic ? new Point(150, 7) : new Point(225, 7),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Font = new Font("Segoe UI", 8F, FontStyle.Bold),
                 Cursor = Cursors.Hand
             };
-            btnChangePass.FlatAppearance.BorderSize = 0;
-            btnChangePass.Click += (s, e) => ShowChangePasswordView();
+            btnLogs.FlatAppearance.BorderSize = 0;
+            btnLogs.Click += (s, e) => ShowActivityLogsView();
+
+            Button btnTimer = new Button
+            {
+                Text = Loc.T("⏳ مؤقت", "⏳ Timer"),
+                Size = new Size(62, 24),
+                Location = Loc.IsArabic ? new Point(84, 7) : new Point(295, 7),
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnTimer.FlatAppearance.BorderSize = 0;
+            btnTimer.Click += (s, e) => ShowAutoLockTimerView();
+
+            Button btnPass = new Button
+            {
+                Text = Loc.T("🔑", "🔑"),
+                Size = new Size(32, 24),
+                Location = Loc.IsArabic ? new Point(48, 7) : new Point(362, 7),
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnPass.FlatAppearance.BorderSize = 0;
+            btnPass.Click += (s, e) => ShowChangePasswordView();
 
             Button btnLock = new Button
             {
-                Text = Loc.T("🔒 قفل", "🔒 Lock"),
-                Size = new Size(60, 26),
-                Location = Loc.IsArabic ? new Point(15, 8) : new Point(355, 8),
+                Text = Loc.T("🔒", "🔒"),
+                Size = new Size(32, 24),
+                Location = Loc.IsArabic ? new Point(12, 7) : new Point(398, 7),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Font = new Font("Segoe UI", 8F, FontStyle.Bold),
                 Cursor = Cursors.Hand
             };
             btnLock.FlatAppearance.BorderSize = 0;
             btnLock.Click += (s, e) => ShowUnlockView();
 
-            // 2. قسم منافذ فلاشات USB
+            // 2. حالة المؤقت إن وجد
+            lblTimerStatus = new Label
+            {
+                Text = AutoLockTimerManager.IsTimerRunning
+                    ? Loc.T(string.Format("⏳ المؤقت: يغلق تلقائياً بعد {0:D2}:{1:D2}", AutoLockTimerManager.RemainingSeconds / 60, AutoLockTimerManager.RemainingSeconds % 60), "⏳ Timer active")
+                    : "",
+                ForeColor = Color.FromArgb(251, 191, 36),
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Location = new Point(12, 34),
+                Size = new Size(424, 18),
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+
+            // 3. قسم منافذ فلاشات USB
             lblUsbStatus = new Label
             {
                 Text = Loc.T("💾 منافذ الفلاشات: جاري الفحص...", "💾 USB Storage: Checking..."),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(15, 42),
-                Size = new Size(398, 20),
+                Location = new Point(12, 54),
+                Size = new Size(424, 18),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             btnToggleUsb = new Button
             {
                 Text = Loc.T("تغيير الحالة", "Toggle Status"),
-                Location = new Point(15, 65),
-                Size = new Size(398, 38),
+                Location = new Point(12, 75),
+                Size = new Size(424, 38),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
                 Cursor = Cursors.Hand
@@ -821,22 +1084,22 @@ namespace USBPortControllerApp
             btnToggleUsb.FlatAppearance.BorderSize = 0;
             btnToggleUsb.Click += BtnToggleUsb_Click;
 
-            // 3. قسم وضع الحماية من النسخ (Write-Protect)
+            // 4. قسم وضع الحماية من النسخ (Write-Protect)
             lblWriteProtectStatus = new Label
             {
                 Text = Loc.T("✍️ الحماية من النسخ: جاري الفحص...", "✍️ Write Protection: Checking..."),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(15, 110),
-                Size = new Size(398, 20),
+                Location = new Point(12, 118),
+                Size = new Size(424, 18),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             btnToggleWriteProtect = new Button
             {
                 Text = Loc.T("تغيير وضع الحماية", "Toggle Protection"),
-                Location = new Point(15, 133),
-                Size = new Size(398, 38),
+                Location = new Point(12, 139),
+                Size = new Size(424, 38),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
                 Cursor = Cursors.Hand
@@ -844,22 +1107,22 @@ namespace USBPortControllerApp
             btnToggleWriteProtect.FlatAppearance.BorderSize = 0;
             btnToggleWriteProtect.Click += BtnToggleWriteProtect_Click;
 
-            // 4. قسم التشغيل التلقائي مع إقلاع الجهاز
+            // 5. قسم التشغيل التلقائي مع إقلاع الجهاز
             lblAutoStartStatus = new Label
             {
                 Text = Loc.T("🔄 الحماية مع إقلاع الويندوز: جاري الفحص...", "🔄 Startup Protection: Checking..."),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(15, 178),
-                Size = new Size(398, 20),
+                Location = new Point(12, 182),
+                Size = new Size(424, 18),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             btnToggleAutoStart = new Button
             {
                 Text = Loc.T("تبديل وضع الإقلاع", "Toggle Startup Mode"),
-                Location = new Point(15, 201),
-                Size = new Size(398, 38),
+                Location = new Point(12, 203),
+                Size = new Size(424, 38),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
                 Cursor = Cursors.Hand
@@ -867,12 +1130,27 @@ namespace USBPortControllerApp
             btnToggleAutoStart.FlatAppearance.BorderSize = 0;
             btnToggleAutoStart.Click += BtnToggleAutoStart_Click;
 
-            // 5. زر إيقاف الخدمة والخروج تماماً
+            // 6. زر إعدادات تنبيهات تيليجرام
+            Button btnTgAlerts = new Button
+            {
+                Text = Loc.T("🔔 إعدادات التنبيهات وإشعارات Telegram", "🔔 Telegram & Notification Alerts"),
+                Location = new Point(12, 248),
+                Size = new Size(424, 34),
+                BackColor = Color.FromArgb(14, 116, 144),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnTgAlerts.FlatAppearance.BorderSize = 0;
+            btnTgAlerts.Click += (s, e) => ShowTelegramSettingsView();
+
+            // 7. زر إيقاف الخدمة والخروج تماماً
             Button btnStopService = new Button
             {
                 Text = Loc.T("🛑 إيقاف الحماية والخروج تماماً", "🛑 Stop Protection & Exit Completely"),
-                Location = new Point(15, 250),
-                Size = new Size(398, 38),
+                Location = new Point(12, 290),
+                Size = new Size(424, 36),
                 BackColor = Color.FromArgb(185, 28, 28),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -882,28 +1160,32 @@ namespace USBPortControllerApp
             btnStopService.FlatAppearance.BorderSize = 0;
             btnStopService.Click += (s, e) => ExitApplication();
 
-            // 6. مؤشر المراقبة الحية
+            // 8. مؤشر المراقبة الحية
             lblLiveIndicator = new Label
             {
                 Text = Loc.T("🟢 الحماية نشطة ومستمرة (يكتشف الأجهزة تلقائياً)", "🟢 Protection Active & Persistent (Auto-detects Devices)"),
                 ForeColor = Color.FromArgb(148, 163, 184),
                 Font = new Font("Segoe UI", 8.5F),
-                Location = new Point(15, 298),
-                Size = new Size(398, 20),
+                Location = new Point(12, 335),
+                Size = new Size(424, 20),
                 TextAlign = ContentAlignment.MiddleCenter
             };
 
             contentCard.Controls.Add(picLogo);
             contentCard.Controls.Add(lblTitle);
             contentCard.Controls.Add(btnLang);
-            contentCard.Controls.Add(btnChangePass);
+            contentCard.Controls.Add(btnLogs);
+            contentCard.Controls.Add(btnTimer);
+            contentCard.Controls.Add(btnPass);
             contentCard.Controls.Add(btnLock);
+            contentCard.Controls.Add(lblTimerStatus);
             contentCard.Controls.Add(lblUsbStatus);
             contentCard.Controls.Add(btnToggleUsb);
             contentCard.Controls.Add(lblWriteProtectStatus);
             contentCard.Controls.Add(btnToggleWriteProtect);
             contentCard.Controls.Add(lblAutoStartStatus);
             contentCard.Controls.Add(btnToggleAutoStart);
+            contentCard.Controls.Add(btnTgAlerts);
             contentCard.Controls.Add(btnStopService);
             contentCard.Controls.Add(lblLiveIndicator);
 
@@ -911,17 +1193,353 @@ namespace USBPortControllerApp
         }
         #endregion
 
-        #region View 4: شاشة تغيير كلمة السر
+        #region View 4: شاشة سجل الأحداث الأمنية (Activity Logs)
+        private void ShowActivityLogsView()
+        {
+            activeView = CurrentViewType.ActivityLogs;
+            contentCard.Controls.Clear();
+
+            Label lblTitle = new Label
+            {
+                Text = Loc.T("📋 سجل النشاط والأحداث الأمنية", "📋 Security Activity & Event Logs"),
+                ForeColor = Color.FromArgb(96, 165, 250),
+                Font = new Font("Segoe UI", 11F, FontStyle.Bold),
+                Location = new Point(12, 10),
+                Size = new Size(424, 24),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            ListBox listLogs = new ListBox
+            {
+                Location = new Point(12, 40),
+                Size = new Size(424, 250),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Consolas", 8.5F),
+                HorizontalScrollbar = true
+            };
+
+            string[] logs = SecurityLogger.ReadRecentLogs(100);
+            if (logs.Length == 0)
+            {
+                listLogs.Items.Add(Loc.T("لا توجد أحداث مسجلة حتى الآن.", "No events recorded yet."));
+            }
+            else
+            {
+                for (int i = logs.Length - 1; i >= 0; i--)
+                {
+                    listLogs.Items.Add(logs[i]);
+                }
+            }
+
+            Button btnExport = new Button
+            {
+                Text = Loc.T("💾 تصدير كملف", "💾 Export Log"),
+                Location = Loc.IsArabic ? new Point(230, 300) : new Point(12, 300),
+                Size = new Size(100, 32),
+                BackColor = Color.FromArgb(37, 99, 235),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnExport.FlatAppearance.BorderSize = 0;
+            btnExport.Click += (s, e) =>
+            {
+                try
+                {
+                    SaveFileDialog sfd = new SaveFileDialog
+                    {
+                        Filter = "Text Log (*.txt)|*.txt|CSV File (*.csv)|*.csv",
+                        FileName = "USB_Security_Report_" + DateTime.Now.ToString("yyyyMMdd_HHmmss")
+                    };
+                    if (sfd.ShowDialog() == DialogResult.OK)
+                    {
+                        File.Copy(SecurityLogger.GetLogPath(), sfd.FileName, true);
+                        MessageBox.Show(Loc.T("تم تصدير السجل بنجاح!", "Log exported successfully!"), Loc.T("نجاح", "Success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                }
+                catch (Exception ex) { MessageBox.Show(ex.Message); }
+            };
+
+            Button btnClear = new Button
+            {
+                Text = Loc.T("🗑️ مسح السجل", "🗑️ Clear"),
+                Location = Loc.IsArabic ? new Point(120, 300) : new Point(120, 300),
+                Size = new Size(100, 32),
+                BackColor = Color.FromArgb(185, 28, 28),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnClear.FlatAppearance.BorderSize = 0;
+            btnClear.Click += (s, e) =>
+            {
+                SecurityLogger.ClearLogs();
+                ShowActivityLogsView();
+            };
+
+            Button btnBack = new Button
+            {
+                Text = Loc.T("رجوع ↩", "Back ↩"),
+                Location = Loc.IsArabic ? new Point(12, 300) : new Point(335, 300),
+                Size = new Size(95, 32),
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9F),
+                Cursor = Cursors.Hand
+            };
+            btnBack.FlatAppearance.BorderSize = 0;
+            btnBack.Click += (s, e) => ShowControlView();
+
+            contentCard.Controls.Add(lblTitle);
+            contentCard.Controls.Add(listLogs);
+            contentCard.Controls.Add(btnExport);
+            contentCard.Controls.Add(btnClear);
+            contentCard.Controls.Add(btnBack);
+        }
+        #endregion
+
+        #region View 5: شاشة المؤقت للفتح المؤقت (Auto-Lock Timer)
+        private void ShowAutoLockTimerView()
+        {
+            activeView = CurrentViewType.AutoLockTimer;
+            contentCard.Controls.Clear();
+
+            Label lblTitle = new Label
+            {
+                Text = Loc.T("⏳ مؤقت الفتح المؤقت والقفل الذاتي", "⏳ Temporary Unlock & Auto-Lock Timer"),
+                ForeColor = Color.FromArgb(96, 165, 250),
+                Font = new Font("Segoe UI", 11F, FontStyle.Bold),
+                Location = new Point(12, 15),
+                Size = new Size(424, 24),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            Label lblDesc = new Label
+            {
+                Text = Loc.T(
+                    "يمكنك فتح المنافذ لفترة محددة، وسيقوم البرنامج بقفلها تلقائياً عند انتهاء الوقت لحماية الجهاز في حال نسيانه:",
+                    "Open USB ports temporarily; the app will automatically lock them when time expires:"
+                ),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Segoe UI", 9F),
+                Location = new Point(12, 45),
+                Size = new Size(424, 40),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            // أزرار مدد المؤقت
+            int[] durations = new int[] { 5, 15, 30, 60 };
+            string[] durLabels = new string[] {
+                Loc.T("⏱️ 5 دقائق", "⏱️ 5 Minutes"),
+                Loc.T("⏱️ 15 دقيقة", "⏱️ 15 Minutes"),
+                Loc.T("⏱️ 30 دقيقة", "⏱️ 30 Minutes"),
+                Loc.T("⏱️ 1 ساعة كاملة", "⏱️ 1 Hour")
+            };
+
+            for (int i = 0; i < durations.Length; i++)
+            {
+                int min = durations[i];
+                Button btnPreset = new Button
+                {
+                    Text = durLabels[i],
+                    Location = new Point(12, 95 + (i * 42)),
+                    Size = new Size(424, 36),
+                    BackColor = Color.FromArgb(30, 58, 138),
+                    ForeColor = Color.White,
+                    FlatStyle = FlatStyle.Flat,
+                    Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                    Cursor = Cursors.Hand
+                };
+                btnPreset.FlatAppearance.BorderSize = 0;
+                btnPreset.Click += (s, e) =>
+                {
+                    SetUsbStorageEnabled(true);
+                    AutoLockTimerManager.StartTimer(min, () =>
+                    {
+                        SetUsbStorageEnabled(false);
+                        RefreshAllStatus();
+                        SecurityLogger.LogEvent("AUTO_LOCK_TRIGGERED", Loc.T("انتهى وقت المؤقت وتم قفل منافذ USB تلقائياً", "Timer expired: USB ports auto-locked"));
+                        if (trayIcon != null)
+                        {
+                            trayIcon.ShowBalloonTip(3000, Loc.T("قفل منافذ USB تلقائياً", "USB Ports Auto-Locked"), Loc.T("انتهت المدة المحددة وتم تأمين المنافذ وقفلها فوراً.", "Timer expired. USB ports are now securely locked."), ToolTipIcon.Warning);
+                        }
+                    });
+                    MessageBox.Show(
+                        Loc.T("تم فتح المنافذ بنجاح، وسيتم قفلها تلقائياً بعد " + min + " دقيقة!", "Ports opened! They will auto-lock in " + min + " minutes!"),
+                        Loc.T("بدء المؤقت", "Timer Started"),
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
+                    ShowControlView();
+                };
+                contentCard.Controls.Add(btnPreset);
+            }
+
+            if (AutoLockTimerManager.IsTimerRunning)
+            {
+                Button btnCancelTimer = new Button
+                {
+                    Text = Loc.T("🛑 إيقاف المؤقت وإلغاؤه الآن", "🛑 Cancel & Stop Timer Now"),
+                    Location = new Point(12, 275),
+                    Size = new Size(424, 36),
+                    BackColor = Color.FromArgb(185, 28, 28),
+                    ForeColor = Color.White,
+                    FlatStyle = FlatStyle.Flat,
+                    Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                    Cursor = Cursors.Hand
+                };
+                btnCancelTimer.FlatAppearance.BorderSize = 0;
+                btnCancelTimer.Click += (s, e) =>
+                {
+                    AutoLockTimerManager.StopTimer();
+                    MessageBox.Show(Loc.T("تم إيقاف المؤقت بنجاح!", "Timer cancelled!"), Loc.T("إلغاء المؤقت", "Timer Cancelled"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    ShowControlView();
+                };
+                contentCard.Controls.Add(btnCancelTimer);
+            }
+
+            Button btnBack = new Button
+            {
+                Text = Loc.T("رجوع", "Back"),
+                Location = new Point(12, 320),
+                Size = new Size(424, 34),
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9F),
+                Cursor = Cursors.Hand
+            };
+            btnBack.FlatAppearance.BorderSize = 0;
+            btnBack.Click += (s, e) => ShowControlView();
+
+            contentCard.Controls.Add(lblTitle);
+            contentCard.Controls.Add(lblDesc);
+            contentCard.Controls.Add(btnBack);
+        }
+        #endregion
+
+        #region View 6: شاشة إعدادات تنبيهات تيليجرام
+        private void ShowTelegramSettingsView()
+        {
+            activeView = CurrentViewType.TelegramSettings;
+            contentCard.Controls.Clear();
+
+            Label lblTitle = new Label
+            {
+                Text = Loc.T("🔔 إعدادات تنبيهات Telegram الفورية", "🔔 Telegram Security Alerts Settings"),
+                ForeColor = Color.FromArgb(96, 165, 250),
+                Font = new Font("Segoe UI", 11F, FontStyle.Bold),
+                Location = new Point(12, 12),
+                Size = new Size(424, 24),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            Label lblDesc = new Label
+            {
+                Text = Loc.T(
+                    "يمكنك ربط البرنامج ببوت Telegram ليصلك إشعار فوري عند إدخال فلاشة غريبة أو محاولة فتح البرنامج بكلمة سر خاطئة:",
+                    "Connect to Telegram bot to receive instant alerts when a USB is plugged in or invalid password is used:"
+                ),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Segoe UI", 8.5F),
+                Location = new Point(12, 40),
+                Size = new Size(424, 36),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            string curToken, curChatId;
+            AlertNotifier.LoadTelegramConfig(out curToken, out curChatId);
+
+            Label lblToken = new Label { Text = Loc.T("رمز البوت (Bot Token):", "Bot Token:"), ForeColor = Color.FromArgb(226, 232, 240), Location = new Point(12, 85), Size = new Size(424, 18), TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft };
+            TextBox txtToken = new TextBox { Text = curToken, Location = new Point(12, 105), Size = new Size(424, 24), BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+
+            Label lblChat = new Label { Text = Loc.T("معرف المحادثة (Chat ID):", "Chat ID:"), ForeColor = Color.FromArgb(226, 232, 240), Location = new Point(12, 140), Size = new Size(424, 18), TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft };
+            TextBox txtChat = new TextBox { Text = curChatId, Location = new Point(12, 160), Size = new Size(424, 24), BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+
+            Button btnTest = new Button
+            {
+                Text = Loc.T("📨 إرسال تنبيه تجريبي", "📨 Send Test Alert"),
+                Location = new Point(12, 200),
+                Size = new Size(424, 34),
+                BackColor = Color.FromArgb(14, 116, 144),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnTest.FlatAppearance.BorderSize = 0;
+            btnTest.Click += (s, e) =>
+            {
+                if (string.IsNullOrEmpty(txtToken.Text) || string.IsNullOrEmpty(txtChat.Text))
+                {
+                    MessageBox.Show(Loc.T("يرجى إدخال رمز البوت ومعرف المحادثة أولاً!", "Please enter Bot Token and Chat ID!"), Loc.T("تنبيه", "Warning"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                AlertNotifier.SendTelegramAlert(txtToken.Text, txtChat.Text, "🧪 رسالة تجريبية من درع منافذ USB: تم الربط بنجاح!");
+                MessageBox.Show(Loc.T("تم إرسال التنبيه التجريبي! تفقد حسابك على تيليجرام.", "Test alert sent! Check your Telegram."), Loc.T("نجاح", "Success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+            };
+
+            Button btnSave = new Button
+            {
+                Text = Loc.T("حفظ الإعدادات", "Save Settings"),
+                Location = Loc.IsArabic ? new Point(12, 245) : new Point(12, 245),
+                Size = new Size(210, 36),
+                BackColor = Color.FromArgb(37, 99, 235),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnSave.FlatAppearance.BorderSize = 0;
+            btnSave.Click += (s, e) =>
+            {
+                AlertNotifier.SaveTelegramConfig(txtToken.Text, txtChat.Text);
+                MessageBox.Show(Loc.T("تم حفظ إعدادات التنبيهات بنجاح!", "Settings saved successfully!"), Loc.T("نجاح", "Success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                ShowControlView();
+            };
+
+            Button btnBack = new Button
+            {
+                Text = Loc.T("رجوع", "Back"),
+                Location = Loc.IsArabic ? new Point(230, 245) : new Point(230, 245),
+                Size = new Size(206, 36),
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9.5F),
+                Cursor = Cursors.Hand
+            };
+            btnBack.FlatAppearance.BorderSize = 0;
+            btnBack.Click += (s, e) => ShowControlView();
+
+            contentCard.Controls.Add(lblTitle);
+            contentCard.Controls.Add(lblDesc);
+            contentCard.Controls.Add(lblToken);
+            contentCard.Controls.Add(txtToken);
+            contentCard.Controls.Add(lblChat);
+            contentCard.Controls.Add(txtChat);
+            contentCard.Controls.Add(btnTest);
+            contentCard.Controls.Add(btnSave);
+            contentCard.Controls.Add(btnBack);
+        }
+        #endregion
+
+        #region View 7: شاشة تغيير كلمة السر
         private void ShowChangePasswordView()
         {
             activeView = CurrentViewType.ChangePassword;
             contentCard.Controls.Clear();
 
             Button btnLang = CreateLangSwitchButton();
-            btnLang.Location = Loc.IsArabic ? new Point(15, 10) : new Point(318, 10);
+            btnLang.Location = Loc.IsArabic ? new Point(12, 10) : new Point(340, 10);
 
             PictureBox picLogo = CreateLogoHeader(38);
-            picLogo.Location = Loc.IsArabic ? new Point(375, 8) : new Point(15, 8);
+            picLogo.Location = Loc.IsArabic ? new Point(390, 8) : new Point(12, 8);
 
             Label lblTitle = new Label
             {
@@ -929,45 +1547,24 @@ namespace USBPortControllerApp
                 ForeColor = Color.FromArgb(96, 165, 250),
                 Font = new Font("Segoe UI", 11.5F, FontStyle.Bold),
                 Location = Loc.IsArabic ? new Point(120, 12) : new Point(60, 12),
-                Size = new Size(245, 24),
+                Size = new Size(260, 24),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
-            Label lblCur = new Label
-            {
-                Text = Loc.T("كلمة السر الحالية:", "Current Password:"),
-                ForeColor = Color.FromArgb(226, 232, 240),
-                Location = new Point(15, 48),
-                Size = new Size(398, 18),
-                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
-            };
-            TextBox txtCurrent = new TextBox { Location = new Point(15, 70), Size = new Size(398, 24), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+            Label lblCur = new Label { Text = Loc.T("كلمة السر الحالية:", "Current Password:"), ForeColor = Color.FromArgb(226, 232, 240), Location = new Point(12, 48), Size = new Size(424, 18), TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft };
+            TextBox txtCurrent = new TextBox { Location = new Point(12, 70), Size = new Size(424, 24), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
 
-            Label lblNew = new Label
-            {
-                Text = Loc.T("كلمة السر الجديدة:", "New Password:"),
-                ForeColor = Color.FromArgb(226, 232, 240),
-                Location = new Point(15, 105),
-                Size = new Size(398, 18),
-                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
-            };
-            TextBox txtNew = new TextBox { Location = new Point(15, 128), Size = new Size(398, 24), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+            Label lblNew = new Label { Text = Loc.T("كلمة السر الجديدة:", "New Password:"), ForeColor = Color.FromArgb(226, 232, 240), Location = new Point(12, 105), Size = new Size(424, 18), TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft };
+            TextBox txtNew = new TextBox { Location = new Point(12, 128), Size = new Size(424, 24), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
 
-            Label lblConf = new Label
-            {
-                Text = Loc.T("تأكيد كلمة السر الجديدة:", "Confirm New Password:"),
-                ForeColor = Color.FromArgb(226, 232, 240),
-                Location = new Point(15, 162),
-                Size = new Size(398, 18),
-                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
-            };
-            TextBox txtConf = new TextBox { Location = new Point(15, 185), Size = new Size(398, 24), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
+            Label lblConf = new Label { Text = Loc.T("تأكيد كلمة السر الجديدة:", "Confirm New Password:"), ForeColor = Color.FromArgb(226, 232, 240), Location = new Point(12, 162), Size = new Size(424, 18), TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft };
+            TextBox txtConf = new TextBox { Location = new Point(12, 185), Size = new Size(424, 24), PasswordChar = '●', BackColor = Color.FromArgb(15, 23, 42), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
 
             Button btnSave = new Button
             {
                 Text = Loc.T("حفظ التغيير", "Save Change"),
-                Location = Loc.IsArabic ? new Point(15, 230) : new Point(15, 230),
-                Size = new Size(210, 38),
+                Location = Loc.IsArabic ? new Point(12, 230) : new Point(12, 230),
+                Size = new Size(220, 38),
                 BackColor = Color.FromArgb(37, 99, 235),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -979,8 +1576,8 @@ namespace USBPortControllerApp
             Button btnBack = new Button
             {
                 Text = Loc.T("رجوع", "Back"),
-                Location = Loc.IsArabic ? new Point(235, 230) : new Point(235, 230),
-                Size = new Size(178, 38),
+                Location = Loc.IsArabic ? new Point(240, 230) : new Point(240, 230),
+                Size = new Size(196, 38),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -994,43 +1591,23 @@ namespace USBPortControllerApp
             {
                 if (!PasswordManager.VerifyPassword(txtCurrent.Text))
                 {
-                    MessageBox.Show(
-                        Loc.T("كلمة السر الحالية غير صحيحة!", "Current password is incorrect!"),
-                        Loc.T("خطأ", "Error"),
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Error
-                    );
+                    MessageBox.Show(Loc.T("كلمة السر الحالية غير صحيحة!", "Current password is incorrect!"), Loc.T("خطأ", "Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
                 if (string.IsNullOrEmpty(txtNew.Text))
                 {
-                    MessageBox.Show(
-                        Loc.T("يرجى إدخال كلمة السر الجديدة!", "Please enter the new password!"),
-                        Loc.T("تنبيه", "Warning"),
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Warning
-                    );
+                    MessageBox.Show(Loc.T("يرجى إدخال كلمة السر الجديدة!", "Please enter the new password!"), Loc.T("تنبيه", "Warning"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
                 if (txtNew.Text != txtConf.Text)
                 {
-                    MessageBox.Show(
-                        Loc.T("كلمتا السر غير متطابقتين!", "Passwords do not match!"),
-                        Loc.T("خطأ", "Error"),
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Error
-                    );
+                    MessageBox.Show(Loc.T("كلمتا السر غير متطابقتين!", "Passwords do not match!"), Loc.T("خطأ", "Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 
                 if (PasswordManager.SetPassword(txtNew.Text))
                 {
-                    MessageBox.Show(
-                        Loc.T("تم تحديث كلمة السر بنجاح!", "Password updated successfully!"),
-                        Loc.T("نجاح", "Success"),
-                        MessageBoxButtons.OK,
-                        MessageBoxIcon.Information
-                    );
+                    MessageBox.Show(Loc.T("تم تحديث كلمة السر بنجاح!", "Password updated successfully!"), Loc.T("نجاح", "Success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
                     ShowControlView();
                 }
             };
@@ -1082,26 +1659,19 @@ namespace USBPortControllerApp
                     if (key != null)
                     {
                         key.SetValue("Start", enable ? 3 : 4, RegistryValueKind.DWord);
+                        SecurityLogger.LogEvent(enable ? "USB_STORAGE_ENABLED" : "USB_STORAGE_DISABLED",
+                            Loc.T(enable ? "تم فتح وتمكين منافذ الفلاشات" : "تم قفل وحظر منافذ الفلاشات",
+                                  enable ? "USB Storage ports opened" : "USB Storage ports blocked"));
                     }
                     else
                     {
-                        MessageBox.Show(
-                            Loc.T("تعذر الوصول إلى مسار سجل USBSTOR!", "Cannot access USBSTOR registry path!"),
-                            Loc.T("خطأ", "Error"),
-                            MessageBoxButtons.OK,
-                            MessageBoxIcon.Error
-                        );
+                        MessageBox.Show(Loc.T("تعذر الوصول إلى مسار سجل USBSTOR!", "Cannot access USBSTOR registry path!"), Loc.T("خطأ", "Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
                     }
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    Loc.T("حدث خطأ أثناء تعديل السجل:\n", "Error modifying registry:\n") + ex.Message,
-                    Loc.T("خطأ في الصلاحيات", "Permission Error"),
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error
-                );
+                MessageBox.Show(Loc.T("حدث خطأ أثناء تعديل السجل:\n", "Error modifying registry:\n") + ex.Message, Loc.T("خطأ في الصلاحيات", "Permission Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -1128,7 +1698,7 @@ namespace USBPortControllerApp
                         int wpVal;
                         if (val != null && int.TryParse(val.ToString(), out wpVal))
                         {
-                            return wpVal == 1; // 1 = Write Protected (Read-only), 0 = Normal
+                            return wpVal == 1; // 1 = Read-only, 0 = Normal
                         }
                     }
                 }
@@ -1146,17 +1716,15 @@ namespace USBPortControllerApp
                     if (key != null)
                     {
                         key.SetValue("WriteProtect", enable ? 1 : 0, RegistryValueKind.DWord);
+                        SecurityLogger.LogEvent(enable ? "WRITE_PROTECT_ENABLED" : "WRITE_PROTECT_DISABLED",
+                            Loc.T(enable ? "تم تفعيل وضع الحماية من النسخ (قراءة فقط)" : "تم تعطيل وضع الحماية من النسخ (عادي)",
+                                  enable ? "Write protection enabled (read-only)" : "Write protection disabled"));
                     }
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    Loc.T("حدث خطأ أثناء تعديل وضع الحماية من الكتابة:\n", "Error modifying write protection:\n") + ex.Message,
-                    Loc.T("خطأ", "Error"),
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Error
-                );
+                MessageBox.Show(Loc.T("حدث خطأ أثناء تعديل وضع الحماية من الكتابة:\n", "Error modifying write protection:\n") + ex.Message, Loc.T("خطأ", "Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -1173,6 +1741,9 @@ namespace USBPortControllerApp
         {
             bool currentAutoStart = AutoStartManager.IsAutoStartEnabled();
             AutoStartManager.SetAutoStart(!currentAutoStart);
+            SecurityLogger.LogEvent(!currentAutoStart ? "AUTOSTART_ENABLED" : "AUTOSTART_DISABLED",
+                Loc.T(!currentAutoStart ? "تم تفعيل بدء التشغيل التلقائي مع الويندوز" : "تم تعطيل بدء التشغيل التلقائي",
+                      !currentAutoStart ? "Auto-start enabled" : "Auto-start disabled"));
             RefreshAllStatus();
         }
         #endregion
@@ -1181,7 +1752,7 @@ namespace USBPortControllerApp
         {
             if (lblUsbStatus == null || btnToggleUsb == null) return;
 
-            // 1. تحديث حالة USB
+            // 1. USB Storage
             bool usbEnabled = IsUsbStorageEnabled();
             if (usbEnabled)
             {
@@ -1198,7 +1769,7 @@ namespace USBPortControllerApp
                 btnToggleUsb.ForeColor = Color.White;
             }
 
-            // 2. تحديث حالة Write Protect
+            // 2. Write-Protect
             bool wpEnabled = IsWriteProtectEnabled();
             if (wpEnabled)
             {
@@ -1215,7 +1786,7 @@ namespace USBPortControllerApp
                 btnToggleWriteProtect.ForeColor = Color.White;
             }
 
-            // 3. تحديث حالة التشغيل التلقائي
+            // 3. Auto-Start
             if (lblAutoStartStatus != null && btnToggleAutoStart != null)
             {
                 bool autoStart = AutoStartManager.IsAutoStartEnabled();
@@ -1244,19 +1815,24 @@ namespace USBPortControllerApp
                 int eventType = m.WParam.ToInt32();
                 if (eventType == DBT_DEVICEARRIVAL)
                 {
-                    lblLiveIndicator.Text = Loc.T(
-                        "🔌 [" + DateTime.Now.ToString("HH:mm:ss") + "] تم توصيل جهاز في منفذ USB",
-                        "🔌 [" + DateTime.Now.ToString("HH:mm:ss") + "] USB Device Plugged In"
-                    );
+                    string time = DateTime.Now.ToString("HH:mm:ss");
+                    lblLiveIndicator.Text = Loc.T("🔌 [" + time + "] تم توصيل جهاز في منفذ USB", "🔌 [" + time + "] USB Device Plugged In");
                     lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
+                    SecurityLogger.LogEvent("DEVICE_CONNECTED", Loc.T("تم توصيل جهاز USB جديد بالجهاز", "USB Device attached"));
+
+                    string botToken, chatId;
+                    AlertNotifier.LoadTelegramConfig(out botToken, out chatId);
+                    if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
+                    {
+                        AlertNotifier.SendTelegramAlert(botToken, chatId, "🔌 إشعار أمني: تم توصيل جهاز USB في الجهاز: " + Environment.MachineName + " في تمام الساعة: " + time);
+                    }
                 }
                 else if (eventType == DBT_DEVICEREMOVECOMPLETE)
                 {
-                    lblLiveIndicator.Text = Loc.T(
-                        "⏏️ [" + DateTime.Now.ToString("HH:mm:ss") + "] تم فصل جهاز من منفذ USB",
-                        "⏏️ [" + DateTime.Now.ToString("HH:mm:ss") + "] USB Device Unplugged"
-                    );
+                    string time = DateTime.Now.ToString("HH:mm:ss");
+                    lblLiveIndicator.Text = Loc.T("⏏️ [" + time + "] تم فصل جهاز من منفذ USB", "⏏️ [" + time + "] USB Device Unplugged");
                     lblLiveIndicator.ForeColor = Color.FromArgb(248, 113, 113);
+                    SecurityLogger.LogEvent("DEVICE_DISCONNECTED", Loc.T("تم فصل جهاز USB من المنفذ", "USB Device removed"));
                 }
             }
         }

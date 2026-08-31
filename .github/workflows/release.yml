@@ -1,0 +1,33 @@
+name: Build and Release USB Port Shield
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild / CSC
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Application & Setup Installer
+        run: |
+          cmd.exe /c "build.bat < nul"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            USBController.exe
+            Setup.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
