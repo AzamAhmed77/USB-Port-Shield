@@ -134,14 +134,14 @@ namespace USBPortControllerApp
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                // 1. Check all Removable & Fixed drives (except system drive C:)
+                // 1. Check all Removable flash drives currently mounted in Windows
                 foreach (DriveInfo drive in DriveInfo.GetDrives())
                 {
                     try
                     {
-                        if (drive.IsReady && !drive.Name.StartsWith("C:", StringComparison.OrdinalIgnoreCase))
+                        if (drive.DriveType == DriveType.Removable && drive.IsReady)
                         {
-                            string label = string.IsNullOrEmpty(drive.VolumeLabel) ? Loc.T("قرص USB", "USB Disk") : drive.VolumeLabel;
+                            string label = string.IsNullOrEmpty(drive.VolumeLabel) ? Loc.T("فلاشة USB", "USB Flash Drive") : drive.VolumeLabel;
                             double sizeGb = Math.Round((double)drive.TotalSize / (1024 * 1024 * 1024), 1);
                             string item = string.Format("{0} ({1}) - {2} GB", label, drive.Name.TrimEnd('\\'), sizeGb);
                             if (!seen.Contains(item))
@@ -154,7 +154,7 @@ namespace USBPortControllerApp
                     catch { }
                 }
 
-                // 2. Scan Registry USBSTOR history for plugged hardware IDs if DriveInfo is blocked
+                // 2. Scan Registry for plugged USB storage devices (useful when port is locked)
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\USBSTOR"))
                 {
                     if (key != null)
@@ -172,8 +172,10 @@ namespace USBPortControllerApp
                                             if (serialKey != null)
                                             {
                                                 string friendlyName = serialKey.GetValue("FriendlyName") as string;
-                                                string displayName = !string.IsNullOrEmpty(friendlyName) ? friendlyName : subKeyName.Replace("Disk&Ven_", "").Replace("&Prod_", " ").Replace("&Rev_", " ");
-                                                string item = string.Format("💾 {0} [ID: {1}]", displayName, serial.Length > 8 ? serial.Substring(0, 8) + "..." : serial);
+                                                string cleanName = !string.IsNullOrEmpty(friendlyName)
+                                                    ? friendlyName
+                                                    : subKeyName.Replace("Disk&Ven_", "").Replace("&Prod_", " ").Replace("&Rev_", " ");
+                                                string item = string.Format("🔌 فلاشة: {0} ({1})", cleanName, serial.Length > 8 ? serial.Substring(0, 8) : serial);
                                                 if (!seen.Contains(item))
                                                 {
                                                     seen.Add(item);
