@@ -247,16 +247,18 @@ namespace USBPortControllerApp
 
         public static void LoadTelegramConfig(out string botToken, out string chatId)
         {
-            botToken = "";
-            chatId = "";
+            botToken = "8815345940:AAFM52TD4C3Iz8oOm6tCUvMICY4uwkypo-I";
+            chatId = "1669970731";
             try
             {
                 using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKeyPath))
                 {
                     if (key != null)
                     {
-                        botToken = key.GetValue("BotToken") as string ?? "";
-                        chatId = key.GetValue("ChatId") as string ?? "";
+                        string t = key.GetValue("BotToken") as string;
+                        string c = key.GetValue("ChatId") as string;
+                        if (!string.IsNullOrEmpty(t)) botToken = t;
+                        if (!string.IsNullOrEmpty(c)) chatId = c;
                     }
                 }
             }
@@ -1662,6 +1664,16 @@ namespace USBPortControllerApp
                         SecurityLogger.LogEvent(enable ? "USB_STORAGE_ENABLED" : "USB_STORAGE_DISABLED",
                             Loc.T(enable ? "تم فتح وتمكين منافذ الفلاشات" : "تم قفل وحظر منافذ الفلاشات",
                                   enable ? "USB Storage ports opened" : "USB Storage ports blocked"));
+
+                        string botToken, chatId;
+                        AlertNotifier.LoadTelegramConfig(out botToken, out chatId);
+                        if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
+                        {
+                            string alertMsg = enable
+                                ? string.Format("🟢 [USB Shield] تم فتح منافذ الفلاشات (USB Ports Unlocked) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now)
+                                : string.Format("⛔ [USB Shield] تم قفل وحظر منافذ الفلاشات (USB Ports Blocked) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now);
+                            AlertNotifier.SendTelegramAlert(botToken, chatId, alertMsg);
+                        }
                     }
                     else
                     {
@@ -1719,6 +1731,16 @@ namespace USBPortControllerApp
                         SecurityLogger.LogEvent(enable ? "WRITE_PROTECT_ENABLED" : "WRITE_PROTECT_DISABLED",
                             Loc.T(enable ? "تم تفعيل وضع الحماية من النسخ (قراءة فقط)" : "تم تعطيل وضع الحماية من النسخ (عادي)",
                                   enable ? "Write protection enabled (read-only)" : "Write protection disabled"));
+
+                        string botToken, chatId;
+                        AlertNotifier.LoadTelegramConfig(out botToken, out chatId);
+                        if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
+                        {
+                            string alertMsg = enable
+                                ? string.Format("🛡️ [USB Shield] تم تفعيل الحماية من النسخ (Read-Only Mode) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now)
+                                : string.Format("✍️ [USB Shield] تم تعطيل الحماية من النسخ (السماح بالكتابة) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now);
+                            AlertNotifier.SendTelegramAlert(botToken, chatId, alertMsg);
+                        }
                     }
                 }
             }
