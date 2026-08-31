@@ -83,6 +83,359 @@ namespace USBPortControllerApp
     }
     #endregion
 
+    #region USB Hardware & PnP Controller Manager
+    public class UsbDeviceInfo
+    {
+        public string InstanceId { get; set; }
+        public string Description { get; set; }
+        public string SerialNumber { get; set; }
+        public string Status { get; set; }
+        public string DriveLetter { get; set; }
+        public string DisplayName { get; set; }
+    }
+
+    public static class UsbHardwareManager
+    {
+        public static List<UsbDeviceInfo> GetActiveUsbStorageDevices()
+        {
+            List<UsbDeviceInfo> list = new List<UsbDeviceInfo>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // 1. Scan via pnputil for DiskDrive class
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/enum-devices /class DiskDrive")
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null)
+                    {
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit(3000);
+                        ParsePnpUtilOutput(output, list, seen);
+                    }
+                }
+            }
+            catch { }
+
+            // 2. Scan via pnputil for USB class (USB Mass Storage devices)
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/enum-devices /class USB")
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null)
+                    {
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit(3000);
+                        ParsePnpUtilOutput(output, list, seen);
+                    }
+                }
+            }
+            catch { }
+
+            // 3. Match with mounted DriveInfo volumes for drive letters
+            try
+            {
+                foreach (DriveInfo d in DriveInfo.GetDrives())
+                {
+                    if (d.DriveType == DriveType.Removable && d.IsReady)
+                    {
+                        string label = string.IsNullOrEmpty(d.VolumeLabel) ? Loc.T("فلاشة USB", "USB Flash Drive") : d.VolumeLabel;
+                        double sizeGb = Math.Round((double)d.TotalSize / (1024 * 1024 * 1024), 1);
+                        string letter = d.Name.TrimEnd('\\');
+
+                        bool matched = false;
+                        foreach (var item in list)
+                        {
+                            if (string.IsNullOrEmpty(item.DriveLetter))
+                            {
+                                item.DriveLetter = letter;
+                                item.DisplayName = string.Format("🔌 {0} ({1}) - {2} GB", item.Description, letter, sizeGb);
+                                matched = true;
+                                break;
+                            }
+                        }
+
+                        if (!matched && !seen.Contains(d.Name))
+                        {
+                            seen.Add(d.Name);
+                            list.Add(new UsbDeviceInfo
+                            {
+                                InstanceId = d.Name,
+                                Description = label,
+                                DriveLetter = letter,
+                                DisplayName = string.Format("🔌 {0} ({1}) - {2} GB", label, letter, sizeGb),
+                                Status = "Started"
+                            });
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return list;
+        }
+
+        private static void ParsePnpUtilOutput(string output, List<UsbDeviceInfo> list, HashSet<string> seen)
+        {
+            if (string.IsNullOrEmpty(output)) return;
+            string[] lines = output.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+            string currentId = null;
+            string currentDesc = null;
+            string currentStatus = null;
+            string currentDriver = null;
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i].Trim();
+                if (line.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase))
+                {
+                    ProcessPnpEntry(currentId, currentDesc, currentStatus, currentDriver, list, seen);
+                    currentId = line.Substring("Instance ID:".Length).Trim();
+                    currentDesc = null;
+                    currentStatus = null;
+                    currentDriver = null;
+                }
+                else if (line.StartsWith("Device Description:", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentDesc = line.Substring("Device Description:".Length).Trim();
+                }
+                else if (line.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentStatus = line.Substring("Status:".Length).Trim();
+                }
+                else if (line.StartsWith("Driver Name:", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentDriver = line.Substring("Driver Name:".Length).Trim();
+                }
+            }
+            ProcessPnpEntry(currentId, currentDesc, currentStatus, currentDriver, list, seen);
+        }
+
+        private static void ProcessPnpEntry(string id, string desc, string status, string driver, List<UsbDeviceInfo> list, HashSet<string> seen)
+        {
+            if (string.IsNullOrEmpty(id)) return;
+            bool isUsbStorage = false;
+
+            if (id.StartsWith("USBSTOR", StringComparison.OrdinalIgnoreCase))
+            {
+                isUsbStorage = true;
+            }
+            else if (driver != null && driver.IndexOf("usbstor", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                isUsbStorage = true;
+            }
+            else if (desc != null && (desc.IndexOf("USB Mass Storage", StringComparison.OrdinalIgnoreCase) >= 0 || desc.IndexOf("USB Device", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                isUsbStorage = true;
+            }
+
+            if (isUsbStorage && !seen.Contains(id))
+            {
+                seen.Add(id);
+                string cleanDesc = desc ?? "USB Storage Device";
+                string serial = "";
+                int lastSlash = id.LastIndexOf('\\');
+                if (lastSlash >= 0 && lastSlash < id.Length - 1)
+                {
+                    serial = id.Substring(lastSlash + 1).Replace("&0", "");
+                }
+
+                string shortSerial = serial.Length > 8 ? serial.Substring(0, 8) : (serial.Length > 0 ? serial : "USB");
+                list.Add(new UsbDeviceInfo
+                {
+                    InstanceId = id,
+                    Description = cleanDesc,
+                    SerialNumber = serial,
+                    Status = status ?? "Started",
+                    DisplayName = string.Format("🔌 {0} ({1})", cleanDesc, shortSerial)
+                });
+            }
+        }
+
+        public static void DisableDevice(string instanceId)
+        {
+            if (string.IsNullOrEmpty(instanceId) || instanceId.Length <= 3) return;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", string.Format("/disable-device \"{0}\"", instanceId))
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null) p.WaitForExit(3000);
+                }
+            }
+            catch { }
+        }
+
+        public static void EnableDevice(string instanceId)
+        {
+            if (string.IsNullOrEmpty(instanceId) || instanceId.Length <= 3) return;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", string.Format("/enable-device \"{0}\"", instanceId))
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null) p.WaitForExit(3000);
+                }
+            }
+            catch { }
+        }
+
+        public static void RestartDevice(string instanceId)
+        {
+            if (string.IsNullOrEmpty(instanceId) || instanceId.Length <= 3) return;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", string.Format("/restart-device \"{0}\"", instanceId))
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null) p.WaitForExit(3000);
+                }
+            }
+            catch { }
+        }
+
+        public static void DisableAllUsbStorage()
+        {
+            // 1. Registry: Set USBSTOR Start = 4
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("Start", 4, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+
+            // 2. Hardware: Disable all active USB storage devices immediately via pnputil
+            var devices = GetActiveUsbStorageDevices();
+            foreach (var dev in devices)
+            {
+                DisableDevice(dev.InstanceId);
+            }
+        }
+
+        public static void EnableAllUsbStorage()
+        {
+            // 1. Registry: Set USBSTOR Start = 3
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("Start", 3, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+
+            // 2. Hardware: Enable all USB storage devices and rescan
+            var devices = GetActiveUsbStorageDevices();
+            foreach (var dev in devices)
+            {
+                EnableDevice(dev.InstanceId);
+            }
+
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/scan-devices")
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null) p.WaitForExit(3000);
+                }
+            }
+            catch { }
+        }
+
+        public static void EnforceWhitelist()
+        {
+            if (!WhitelistManager.IsWhitelistModeEnabled()) return;
+
+            var whitelisted = WhitelistManager.GetWhitelistedDevices();
+            var connected = GetActiveUsbStorageDevices();
+
+            // Ensure USBSTOR registry is enabled so drivers can match
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("Start", 3, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+
+            foreach (var dev in connected)
+            {
+                bool authorized = false;
+                foreach (var w in whitelisted)
+                {
+                    if (dev.InstanceId.IndexOf(w.DeviceId, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        w.DeviceId.IndexOf(dev.InstanceId, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        dev.Description.IndexOf(w.Name, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        w.Name.IndexOf(dev.Description, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        (!string.IsNullOrEmpty(dev.SerialNumber) && dev.SerialNumber.IndexOf(w.DeviceId, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                        (!string.IsNullOrEmpty(dev.SerialNumber) && w.DeviceId.IndexOf(dev.SerialNumber, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                        (!string.IsNullOrEmpty(dev.DisplayName) && dev.DisplayName.IndexOf(w.Name, StringComparison.OrdinalIgnoreCase) >= 0) ||
+                        (!string.IsNullOrEmpty(dev.DisplayName) && w.Name.IndexOf(dev.DisplayName, StringComparison.OrdinalIgnoreCase) >= 0))
+                    {
+                        authorized = true;
+                        break;
+                    }
+                }
+
+                if (authorized)
+                {
+                    EnableDevice(dev.InstanceId);
+                }
+                else
+                {
+                    DisableDevice(dev.InstanceId);
+                }
+            }
+        }
+    }
+    #endregion
+
     #region USB Whitelist Manager
     public class WhitelistDevice
     {
@@ -131,63 +484,12 @@ namespace USBPortControllerApp
         public static List<string> GetConnectedUsbDrives()
         {
             List<string> drives = new List<string>();
-            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
-                // 1. Check all Removable flash drives currently mounted in Windows
-                foreach (DriveInfo drive in DriveInfo.GetDrives())
+                var devices = UsbHardwareManager.GetActiveUsbStorageDevices();
+                foreach (var dev in devices)
                 {
-                    try
-                    {
-                        if (drive.DriveType == DriveType.Removable && drive.IsReady)
-                        {
-                            string label = string.IsNullOrEmpty(drive.VolumeLabel) ? Loc.T("فلاشة USB", "USB Flash Drive") : drive.VolumeLabel;
-                            double sizeGb = Math.Round((double)drive.TotalSize / (1024 * 1024 * 1024), 1);
-                            string item = string.Format("{0} ({1}) - {2} GB", label, drive.Name.TrimEnd('\\'), sizeGb);
-                            if (!seen.Contains(item))
-                            {
-                                seen.Add(item);
-                                drives.Add(item);
-                            }
-                        }
-                    }
-                    catch { }
-                }
-
-                // 2. Scan Registry for plugged USB storage devices (useful when port is locked)
-                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\USBSTOR"))
-                {
-                    if (key != null)
-                    {
-                        foreach (string subKeyName in key.GetSubKeyNames())
-                        {
-                            using (RegistryKey subKey = key.OpenSubKey(subKeyName))
-                            {
-                                if (subKey != null)
-                                {
-                                    foreach (string serial in subKey.GetSubKeyNames())
-                                    {
-                                        using (RegistryKey serialKey = subKey.OpenSubKey(serial))
-                                        {
-                                            if (serialKey != null)
-                                            {
-                                                string friendlyName = serialKey.GetValue("FriendlyName") as string;
-                                                string cleanName = !string.IsNullOrEmpty(friendlyName)
-                                                    ? friendlyName
-                                                    : subKeyName.Replace("Disk&Ven_", "").Replace("&Prod_", " ").Replace("&Rev_", " ");
-                                                string item = string.Format("🔌 فلاشة: {0} ({1})", cleanName, serial.Length > 8 ? serial.Substring(0, 8) : serial);
-                                                if (!seen.Contains(item))
-                                                {
-                                                    seen.Add(item);
-                                                    drives.Add(item);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    drives.Add(dev.DisplayName ?? dev.Description);
                 }
             }
             catch { }
@@ -2435,7 +2737,7 @@ namespace USBPortControllerApp
         }
         #endregion
 
-        #region USB Storage Management (USBSTOR Registry)
+        #region USB Storage Management (USBSTOR Registry + PnP Hardware Control)
         private const string UsbStorPath = @"SYSTEM\CurrentControlSet\Services\USBSTOR";
 
         private bool IsUsbStorageEnabled()
@@ -2463,51 +2765,32 @@ namespace USBPortControllerApp
         {
             try
             {
-                // CRITICAL FIX: When whitelist mode is active with authorized devices,
-                // NEVER disable USBSTOR — keep it enabled so whitelisted devices work.
-                // This solves the bug where whitelisted flash drives were not appearing
-                // because the USBSTOR driver was completely disabled (Start=4).
-                if (!enable && WhitelistManager.IsWhitelistModeEnabled())
+                if (enable)
                 {
-                    var whitelistedDevices = WhitelistManager.GetWhitelistedDevices();
-                    if (whitelistedDevices.Count > 0)
-                    {
-                        // Don't disable USBSTOR — whitelist mode needs it enabled
-                        SecurityLogger.LogEvent("WHITELIST_OVERRIDE", Loc.T(
-                            "تم منع تعطيل USBSTOR لأن القائمة البيضاء مفعلة مع أجهزة مصرح بها",
-                            "USBSTOR disable blocked: Whitelist mode active with authorized devices"));
-                        return;
-                    }
+                    UsbHardwareManager.EnableAllUsbStorage();
+                    SecurityLogger.LogEvent("USB_STORAGE_ENABLED",
+                        Loc.T("تم فتح وتمكين منافذ الفلاشات", "USB Storage ports opened"));
+                }
+                else
+                {
+                    UsbHardwareManager.DisableAllUsbStorage();
+                    SecurityLogger.LogEvent("USB_STORAGE_DISABLED",
+                        Loc.T("تم قفل وحظر منافذ الفلاشات فوراً", "USB Storage ports blocked"));
                 }
 
-                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(UsbStorPath, true))
+                string botToken, chatId;
+                AlertNotifier.LoadTelegramConfig(out botToken, out chatId);
+                if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
                 {
-                    if (key != null)
-                    {
-                        key.SetValue("Start", enable ? 3 : 4, RegistryValueKind.DWord);
-                        SecurityLogger.LogEvent(enable ? "USB_STORAGE_ENABLED" : "USB_STORAGE_DISABLED",
-                            Loc.T(enable ? "تم فتح وتمكين منافذ الفلاشات" : "تم قفل وحظر منافذ الفلاشات",
-                                  enable ? "USB Storage ports opened" : "USB Storage ports blocked"));
-
-                        string botToken, chatId;
-                        AlertNotifier.LoadTelegramConfig(out botToken, out chatId);
-                        if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
-                        {
-                            string alertMsg = enable
-                                ? string.Format("🟢 [USB Shield] تم فتح منافذ الفلاشات (USB Ports Unlocked) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now)
-                                : string.Format("⛔ [USB Shield] تم قفل وحظر منافذ الفلاشات (USB Ports Blocked) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now);
-                            AlertNotifier.SendTelegramAlert(botToken, chatId, alertMsg);
-                        }
-                    }
-                    else
-                    {
-                        MessageBox.Show(Loc.T("تعذر الوصول إلى مسار سجل USBSTOR!", "Cannot access USBSTOR registry path!"), Loc.T("خطأ", "Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    }
+                    string alertMsg = enable
+                        ? string.Format("🟢 [USB Shield] تم فتح منافذ الفلاشات (USB Ports Unlocked) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now)
+                        : string.Format("⛔ [USB Shield] تم قفل وحظر منافذ الفلاشات (USB Ports Blocked) على جهاز {0} في تمام {1:HH:mm:ss}", Environment.MachineName, DateTime.Now);
+                    AlertNotifier.SendTelegramAlert(botToken, chatId, alertMsg);
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show(Loc.T("حدث خطأ أثناء تعديل السجل:\n", "Error modifying registry:\n") + ex.Message, Loc.T("خطأ في الصلاحيات", "Permission Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(Loc.T("حدث خطأ أثناء تعديل المنافذ:\n", "Error modifying ports:\n") + ex.Message, Loc.T("خطأ في الصلاحيات", "Permission Error"), MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -2552,6 +2835,21 @@ namespace USBPortControllerApp
                     if (key != null)
                     {
                         key.SetValue("WriteProtect", enable ? 1 : 0, RegistryValueKind.DWord);
+                        
+                        // Restart connected USB devices so write protection takes effect immediately
+                        ThreadPool.QueueUserWorkItem(delegate
+                        {
+                            try
+                            {
+                                var devices = UsbHardwareManager.GetActiveUsbStorageDevices();
+                                foreach (var d in devices)
+                                {
+                                    UsbHardwareManager.RestartDevice(d.InstanceId);
+                                }
+                            }
+                            catch { }
+                        });
+
                         SecurityLogger.LogEvent(enable ? "WRITE_PROTECT_ENABLED" : "WRITE_PROTECT_DISABLED",
                             Loc.T(enable ? "تم تفعيل وضع الحماية من النسخ (قراءة فقط)" : "تم تعطيل وضع الحماية من النسخ (عادي)",
                                   enable ? "Write protection enabled (read-only)" : "Write protection disabled"));
@@ -2665,50 +2963,55 @@ namespace USBPortControllerApp
 
                     if (WhitelistManager.IsWhitelistModeEnabled())
                     {
-                        var whitelistedDevices = WhitelistManager.GetWhitelistedDevices();
-                        
-                        if (whitelistedDevices.Count > 0)
+                        // Run whitelist enforcement in background thread
+                        ThreadPool.QueueUserWorkItem(delegate
                         {
-                            // Whitelist mode with devices: USBSTOR should already be enabled
-                            // Ensure it stays enabled for whitelisted devices
-                            if (!IsUsbStorageEnabled())
-                            {
-                                SetUsbStorageEnabled(true);
-                            }
-                            RefreshAllStatus();
-                            
-                            // Trigger PNP rescan to ensure device mounts
-                            ThreadPool.QueueUserWorkItem(delegate
-                            {
-                                try
-                                {
-                                    ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/scan-devices")
-                                    {
-                                        CreateNoWindow = true,
-                                        UseShellExecute = false,
-                                        WindowStyle = ProcessWindowStyle.Hidden
-                                    };
-                                    using (Process p = Process.Start(psi))
-                                    {
-                                        if (p != null) p.WaitForExit(3000);
-                                    }
-                                }
-                                catch { }
-                            });
+                            Thread.Sleep(600); // Give Windows time to register device
+                            UsbHardwareManager.EnforceWhitelist();
 
-                            lblLiveIndicator.Text = Loc.T("🟢 [" + time + "] فلاشة مصرح بها — متاحة فوراً", "🟢 [" + time + "] Whitelisted USB — mounted");
-                            lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
-                            // Non-whitelisted device -> Enforce lock
-                            SetUsbStorageEnabled(false);
-                            RefreshAllStatus();
-                            lblLiveIndicator.Text = Loc.T("⛔ [" + time + "] تم حظر فلاشة غير مصرح بها فوراً", "⛔ [" + time + "] Blocked unauthorized USB");
-                            lblLiveIndicator.ForeColor = Color.FromArgb(248, 113, 113);
-                            SecurityLogger.LogEvent("UNAUTHORIZED_DEVICE_BLOCKED", Loc.T("تم حظر جهاز USB غير مدرج في القائمة البيضاء", "Unauthorized USB blocked by Whitelist"));
-                        }
+                            try
+                            {
+                                this.BeginInvoke((MethodInvoker)delegate
+                                {
+                                    var connected = UsbHardwareManager.GetActiveUsbStorageDevices();
+                                    var whitelisted = WhitelistManager.GetWhitelistedDevices();
+                                    bool hasAllowed = false;
+                                    foreach (var d in connected)
+                                    {
+                                        foreach (var w in whitelisted)
+                                        {
+                                            if (d.InstanceId.IndexOf(w.DeviceId, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                w.DeviceId.IndexOf(d.InstanceId, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                d.Description.IndexOf(w.Name, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                w.Name.IndexOf(d.Description, StringComparison.OrdinalIgnoreCase) >= 0)
+                                            {
+                                                hasAllowed = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (hasAllowed)
+                                    {
+                                        lblLiveIndicator.Text = Loc.T("🟢 [" + time + "] تم السماح بفلاشة مصرح بها", "🟢 [" + time + "] Whitelisted USB allowed");
+                                        lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
+                                        SecurityLogger.LogEvent("WHITELIST_DEVICE_ALLOWED", Loc.T("تم تنشيط فلاشة مصرح بها من القائمة البيضاء", "Whitelisted USB activated"));
+                                    }
+                                    else
+                                    {
+                                        lblLiveIndicator.Text = Loc.T("⛔ [" + time + "] تم حظر فلاشة غير مصرح بها", "⛔ [" + time + "] Blocked unauthorized USB");
+                                        lblLiveIndicator.ForeColor = ClrAccentRed;
+                                        SecurityLogger.LogEvent("UNAUTHORIZED_DEVICE_BLOCKED", Loc.T("تم حظر جهاز USB غير مدرج في القائمة البيضاء", "Unauthorized USB blocked by Whitelist"));
+                                    }
+                                    RefreshAllStatus();
+                                });
+                            }
+                            catch { }
+                        });
                     }
                     else
                     {
-                        lblLiveIndicator.Text = Loc.T("🔌 [" + time + "] تم توصيل جهاز في منفذ USB", "🔌 [" + time + "] USB Device Plugged In");
+                        lblLiveIndicator.Text = Loc.T("🔌 [" + time + "] تم توصيل جهاز USB", "🔌 [" + time + "] USB Device Connected");
                         lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
                         SecurityLogger.LogEvent("DEVICE_CONNECTED", Loc.T("تم توصيل جهاز USB جديد بالجهاز", "USB Device attached"));
                     }
@@ -2718,7 +3021,7 @@ namespace USBPortControllerApp
                     if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
                     {
                         string alertText = WhitelistManager.IsWhitelistModeEnabled()
-                            ? string.Format("🛡️ [USB Shield - القائمة البيضاء] تم توصيل جهاز USB على {0} في تمام {1}. تم التحقق من التصريح والسماح به.", Environment.MachineName, time)
+                            ? string.Format("🛡️ [USB Shield - القائمة البيضاء] تم توصيل جهاز USB على {0} في تمام {1}. تم فحص القائمة البيضاء.", Environment.MachineName, time)
                             : string.Format("🔌 [USB Shield] تم توصيل جهاز USB في الجهاز {0} في تمام الساعة: {1}", Environment.MachineName, time);
                         AlertNotifier.SendTelegramAlert(botToken, chatId, alertText);
                     }
@@ -2726,8 +3029,8 @@ namespace USBPortControllerApp
                 else if (eventType == DBT_DEVICEREMOVECOMPLETE)
                 {
                     string time = DateTime.Now.ToString("HH:mm:ss");
-                    lblLiveIndicator.Text = Loc.T("⏏️ [" + time + "] تم فصل جهاز من منفذ USB", "⏏️ [" + time + "] USB Device Unplugged");
-                    lblLiveIndicator.ForeColor = Color.FromArgb(248, 113, 113);
+                    lblLiveIndicator.Text = Loc.T("⏏️ [" + time + "] تم فصل جهاز USB", "⏏️ [" + time + "] USB Device Unplugged");
+                    lblLiveIndicator.ForeColor = ClrAccentRed;
                     SecurityLogger.LogEvent("DEVICE_DISCONNECTED", Loc.T("تم فصل جهاز USB من المنفذ", "USB Device removed"));
                 }
             }
