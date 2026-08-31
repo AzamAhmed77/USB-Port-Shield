@@ -81,6 +81,8 @@ namespace USBPortControllerApp
             return LogFilePath;
         }
     }
+    #endregion
+
     #region USB Whitelist Manager
     public class WhitelistDevice
     {
