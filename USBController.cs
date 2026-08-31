@@ -81,6 +81,134 @@ namespace USBPortControllerApp
             return LogFilePath;
         }
     }
+    #region USB Whitelist Manager
+    public class WhitelistDevice
+    {
+        public string DeviceId { get; set; }
+        public string Name { get; set; }
+        public string AddedDate { get; set; }
+    }
+
+    public static class WhitelistManager
+    {
+        private const string RegKeyPath = @"Software\USBPortController\Whitelist";
+        private const string EnabledValue = "WhitelistEnabled";
+
+        public static bool IsWhitelistModeEnabled()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKeyPath))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(EnabledValue);
+                        if (val != null) return Convert.ToInt32(val) == 1;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        public static void SetWhitelistModeEnabled(bool enable)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKeyPath))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue(EnabledValue, enable ? 1 : 0, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static List<WhitelistDevice> GetWhitelistedDevices()
+        {
+            List<WhitelistDevice> list = new List<WhitelistDevice>();
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKeyPath + @"\Devices"))
+                {
+                    if (key != null)
+                    {
+                        foreach (string name in key.GetValueNames())
+                        {
+                            string data = key.GetValue(name) as string ?? "";
+                            string[] parts = data.Split('|');
+                            list.Add(new WhitelistDevice
+                            {
+                                DeviceId = name,
+                                Name = parts.Length > 0 ? parts[0] : name,
+                                AddedDate = parts.Length > 1 ? parts[1] : DateTime.Now.ToString("yyyy-MM-dd")
+                            });
+                        }
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        public static void AddDevice(string deviceId, string deviceName)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKeyPath + @"\Devices"))
+                {
+                    if (key != null)
+                    {
+                        string data = string.Format("{0}|{1:yyyy-MM-dd HH:mm}", deviceName, DateTime.Now);
+                        key.SetValue(deviceId.Trim(), data, RegistryValueKind.String);
+                        SecurityLogger.LogEvent("WHITELIST_DEVICE_ADDED", Loc.T("تمت إضافة جهاز مصرح به للقائمة البيضاء: " + deviceName, "Authorized device added to whitelist: " + deviceName));
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static void RemoveDevice(string deviceId)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegKeyPath + @"\Devices"))
+                {
+                    if (key != null)
+                    {
+                        key.DeleteValue(deviceId, false);
+                        SecurityLogger.LogEvent("WHITELIST_DEVICE_REMOVED", Loc.T("تم حذف جهاز من القائمة البيضاء: " + deviceId, "Device removed from whitelist: " + deviceId));
+                    }
+                }
+            }
+            catch { }
+        }
+
+        public static bool IsDeviceAuthorized(string deviceId)
+        {
+            if (!IsWhitelistModeEnabled()) return true;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegKeyPath + @"\Devices"))
+                {
+                    if (key != null)
+                    {
+                        foreach (string name in key.GetValueNames())
+                        {
+                            if (deviceId.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0 || name.IndexOf(deviceId, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+    }
     #endregion
 
     #region Localization Manager
@@ -757,7 +885,8 @@ namespace USBPortControllerApp
             ChangePassword,
             ActivityLogs,
             AutoLockTimer,
-            TelegramSettings
+            TelegramSettings,
+            Whitelist
         }
 
         private CurrentViewType activeView = CurrentViewType.Unlock;
@@ -878,7 +1007,7 @@ namespace USBPortControllerApp
         private void ApplyFormStyling()
         {
             this.Text = Loc.T("درع التحكم في منافذ USB (الإصدار المؤسسي)", "USB Port Controller Shield (Enterprise v2.0)");
-            this.Size = new Size(500, 510);
+            this.Size = new Size(540, 560);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedDialog;
             this.MaximizeBox = false;
@@ -913,7 +1042,7 @@ namespace USBPortControllerApp
             contentCard = new Panel
             {
                 Location = new Point(18, 12),
-                Size = new Size(448, 445),
+                Size = new Size(488, 495),
                 BackColor = Color.FromArgb(30, 41, 59),
                 Padding = new Padding(12)
             };
@@ -947,6 +1076,9 @@ namespace USBPortControllerApp
                     break;
                 case CurrentViewType.TelegramSettings:
                     ShowTelegramSettingsView();
+                    break;
+                case CurrentViewType.Whitelist:
+                    ShowWhitelistView();
                     break;
             }
 
@@ -1265,31 +1397,33 @@ namespace USBPortControllerApp
             activeView = CurrentViewType.Control;
             contentCard.Controls.Clear();
 
-            // 1. الشريط العلوي
-            PictureBox picLogo = CreateLogoHeader(30);
-            picLogo.Location = Loc.IsArabic ? new Point(400, 6) : new Point(12, 6);
+            int cardW = contentCard.Width - 24; // 464
+
+            // 1. الشريط العلوي المتناسق
+            PictureBox picLogo = CreateLogoHeader(28);
+            picLogo.Location = Loc.IsArabic ? new Point(cardW - 28, 8) : new Point(8, 8);
 
             Label lblTitle = new Label
             {
-                Text = Loc.T("🛡️ درع USB", "🛡️ Shield"),
+                Text = Loc.T("درع حماية USB", "USB Shield Pro"),
                 ForeColor = Color.FromArgb(96, 165, 250),
                 Font = new Font("Segoe UI", 10.5F, FontStyle.Bold),
-                Location = Loc.IsArabic ? new Point(290, 8) : new Point(45, 8),
-                Size = new Size(105, 24),
+                Location = Loc.IsArabic ? new Point(cardW - 145, 9) : new Point(40, 9),
+                Size = new Size(110, 24),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             // أزرار شريط الأدوات العلوية السريعة
             Button btnLang = CreateLangSwitchButton();
-            btnLang.Size = new Size(65, 24);
+            btnLang.Size = new Size(58, 26);
             btnLang.Font = new Font("Segoe UI", 8F, FontStyle.Bold);
-            btnLang.Location = Loc.IsArabic ? new Point(220, 7) : new Point(155, 7);
+            btnLang.Location = Loc.IsArabic ? new Point(cardW - 210, 7) : new Point(155, 7);
 
             Button btnLogs = new Button
             {
                 Text = Loc.T("📋 السجل", "📋 Logs"),
-                Size = new Size(65, 24),
-                Location = Loc.IsArabic ? new Point(150, 7) : new Point(225, 7),
+                Size = new Size(62, 26),
+                Location = Loc.IsArabic ? new Point(cardW - 276, 7) : new Point(217, 7),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -1302,8 +1436,8 @@ namespace USBPortControllerApp
             Button btnTimer = new Button
             {
                 Text = Loc.T("⏳ مؤقت", "⏳ Timer"),
-                Size = new Size(62, 24),
-                Location = Loc.IsArabic ? new Point(84, 7) : new Point(295, 7),
+                Size = new Size(60, 26),
+                Location = Loc.IsArabic ? new Point(cardW - 340, 7) : new Point(283, 7),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -1316,8 +1450,8 @@ namespace USBPortControllerApp
             Button btnPass = new Button
             {
                 Text = Loc.T("🔑", "🔑"),
-                Size = new Size(32, 24),
-                Location = Loc.IsArabic ? new Point(48, 7) : new Point(362, 7),
+                Size = new Size(30, 26),
+                Location = Loc.IsArabic ? new Point(42, 7) : new Point(347, 7),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -1330,8 +1464,8 @@ namespace USBPortControllerApp
             Button btnLock = new Button
             {
                 Text = Loc.T("🔒", "🔒"),
-                Size = new Size(32, 24),
-                Location = Loc.IsArabic ? new Point(12, 7) : new Point(398, 7),
+                Size = new Size(30, 26),
+                Location = Loc.IsArabic ? new Point(8, 7) : new Point(381, 7),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -1345,12 +1479,12 @@ namespace USBPortControllerApp
             lblTimerStatus = new Label
             {
                 Text = AutoLockTimerManager.IsTimerRunning
-                    ? Loc.T(string.Format("⏳ المؤقت: يغلق تلقائياً بعد {0:D2}:{1:D2}", AutoLockTimerManager.RemainingSeconds / 60, AutoLockTimerManager.RemainingSeconds % 60), "⏳ Timer active")
+                    ? Loc.T(string.Format("⏳ المؤقت نشط: يغلق تلقائياً بعد {0:D2}:{1:D2}", AutoLockTimerManager.RemainingSeconds / 60, AutoLockTimerManager.RemainingSeconds % 60), "⏳ Auto-locking in active timer")
                     : "",
                 ForeColor = Color.FromArgb(251, 191, 36),
                 Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
-                Location = new Point(12, 34),
-                Size = new Size(424, 18),
+                Location = new Point(8, 38),
+                Size = new Size(cardW, 18),
                 TextAlign = ContentAlignment.MiddleCenter
             };
 
@@ -1360,16 +1494,16 @@ namespace USBPortControllerApp
                 Text = Loc.T("💾 منافذ الفلاشات: جاري الفحص...", "💾 USB Storage: Checking..."),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(12, 54),
-                Size = new Size(424, 18),
+                Location = new Point(8, 60),
+                Size = new Size(cardW, 18),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             btnToggleUsb = new Button
             {
                 Text = Loc.T("تغيير الحالة", "Toggle Status"),
-                Location = new Point(12, 75),
-                Size = new Size(424, 38),
+                Location = new Point(8, 80),
+                Size = new Size(cardW, 36),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
                 Cursor = Cursors.Hand
@@ -1383,16 +1517,16 @@ namespace USBPortControllerApp
                 Text = Loc.T("✍️ الحماية من النسخ: جاري الفحص...", "✍️ Write Protection: Checking..."),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(12, 118),
-                Size = new Size(424, 18),
+                Location = new Point(8, 122),
+                Size = new Size(cardW, 18),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             btnToggleWriteProtect = new Button
             {
                 Text = Loc.T("تغيير وضع الحماية", "Toggle Protection"),
-                Location = new Point(12, 139),
-                Size = new Size(424, 38),
+                Location = new Point(8, 142),
+                Size = new Size(cardW, 36),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
                 Cursor = Cursors.Hand
@@ -1406,16 +1540,16 @@ namespace USBPortControllerApp
                 Text = Loc.T("🔄 الحماية مع إقلاع الويندوز: جاري الفحص...", "🔄 Startup Protection: Checking..."),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(12, 182),
-                Size = new Size(424, 18),
+                Location = new Point(8, 184),
+                Size = new Size(cardW, 18),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             btnToggleAutoStart = new Button
             {
                 Text = Loc.T("تبديل وضع الإقلاع", "Toggle Startup Mode"),
-                Location = new Point(12, 203),
-                Size = new Size(424, 38),
+                Location = new Point(8, 204),
+                Size = new Size(cardW, 36),
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
                 Cursor = Cursors.Hand
@@ -1423,16 +1557,31 @@ namespace USBPortControllerApp
             btnToggleAutoStart.FlatAppearance.BorderSize = 0;
             btnToggleAutoStart.Click += BtnToggleAutoStart_Click;
 
-            // 6. زر إعدادات تنبيهات تيليجرام
+            // 6. صف أزرار الخدمات الإضافية (القائمة البيضاء + إعدادات تيليجرام)
+            int halfW = (cardW - 8) / 2;
+            Button btnWhitelist = new Button
+            {
+                Text = Loc.T("🛡️ القائمة البيضاء (الأجهزة المصرحة)", "🛡️ Device Whitelist"),
+                Location = Loc.IsArabic ? new Point(halfW + 16, 248) : new Point(8, 248),
+                Size = new Size(halfW, 36),
+                BackColor = Color.FromArgb(16, 185, 129),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnWhitelist.FlatAppearance.BorderSize = 0;
+            btnWhitelist.Click += (s, e) => ShowWhitelistView();
+
             Button btnTgAlerts = new Button
             {
-                Text = Loc.T("🔔 إعدادات التنبيهات وإشعارات Telegram", "🔔 Telegram & Notification Alerts"),
-                Location = new Point(12, 248),
-                Size = new Size(424, 34),
+                Text = Loc.T("🔔 إعدادات بوت Telegram", "🔔 Telegram Alerts"),
+                Location = Loc.IsArabic ? new Point(8, 248) : new Point(halfW + 16, 248),
+                Size = new Size(halfW, 36),
                 BackColor = Color.FromArgb(14, 116, 144),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
-                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
                 Cursor = Cursors.Hand
             };
             btnTgAlerts.FlatAppearance.BorderSize = 0;
@@ -1442,8 +1591,8 @@ namespace USBPortControllerApp
             Button btnStopService = new Button
             {
                 Text = Loc.T("🛑 إيقاف الحماية والخروج تماماً", "🛑 Stop Protection & Exit Completely"),
-                Location = new Point(12, 290),
-                Size = new Size(424, 36),
+                Location = new Point(8, 292),
+                Size = new Size(cardW, 36),
                 BackColor = Color.FromArgb(185, 28, 28),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
@@ -1456,11 +1605,11 @@ namespace USBPortControllerApp
             // 8. مؤشر المراقبة الحية
             lblLiveIndicator = new Label
             {
-                Text = Loc.T("🟢 الحماية نشطة ومستمرة (يكتشف الأجهزة تلقائياً)", "🟢 Protection Active & Persistent (Auto-detects Devices)"),
+                Text = Loc.T("🟢 درع الحماية نشط ومستمر (يكتشف الأجهزة تلقائياً)", "🟢 Protection Active & Persistent (Auto-detects Devices)"),
                 ForeColor = Color.FromArgb(148, 163, 184),
                 Font = new Font("Segoe UI", 8.5F),
-                Location = new Point(12, 335),
-                Size = new Size(424, 20),
+                Location = new Point(8, 336),
+                Size = new Size(cardW, 20),
                 TextAlign = ContentAlignment.MiddleCenter
             };
 
@@ -1478,6 +1627,7 @@ namespace USBPortControllerApp
             contentCard.Controls.Add(btnToggleWriteProtect);
             contentCard.Controls.Add(lblAutoStartStatus);
             contentCard.Controls.Add(btnToggleAutoStart);
+            contentCard.Controls.Add(btnWhitelist);
             contentCard.Controls.Add(btnTgAlerts);
             contentCard.Controls.Add(btnStopService);
             contentCard.Controls.Add(lblLiveIndicator);
@@ -1822,6 +1972,162 @@ namespace USBPortControllerApp
         }
         #endregion
 
+        #region View 8: شاشة إدارة القائمة البيضاء للأجهزة المصرحة
+        private void ShowWhitelistView()
+        {
+            activeView = CurrentViewType.Whitelist;
+            contentCard.Controls.Clear();
+
+            int cardW = contentCard.Width - 24;
+
+            Label lblTitle = new Label
+            {
+                Text = Loc.T("🛡️ القائمة البيضاء (الأجهزة المصرح بها)", "🛡️ Authorized Devices Whitelist"),
+                ForeColor = Color.FromArgb(96, 165, 250),
+                Font = new Font("Segoe UI", 11F, FontStyle.Bold),
+                Location = new Point(8, 10),
+                Size = new Size(cardW, 24),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            bool isWhitelistEnabled = WhitelistManager.IsWhitelistModeEnabled();
+            CheckBox chkEnableWhitelist = new CheckBox
+            {
+                Text = Loc.T("تفعيل وضع حظر جميع الفلاشات عدا المصرح بها فقط", "Enforce Whitelist: Block all devices except authorized"),
+                Checked = isWhitelistEnabled,
+                ForeColor = Color.FromArgb(226, 232, 240),
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                Location = new Point(8, 38),
+                Size = new Size(cardW, 26),
+                Cursor = Cursors.Hand
+            };
+            chkEnableWhitelist.CheckedChanged += (s, e) =>
+            {
+                WhitelistManager.SetWhitelistModeEnabled(chkEnableWhitelist.Checked);
+                SecurityLogger.LogEvent(chkEnableWhitelist.Checked ? "WHITELIST_MODE_ENABLED" : "WHITELIST_MODE_DISABLED",
+                    Loc.T(chkEnableWhitelist.Checked ? "تم تفعيل حظر الفلاشات غير المصرح بها" : "تم تعطيل وضع القائمة البيضاء",
+                          chkEnableWhitelist.Checked ? "Whitelist mode enforced" : "Whitelist mode disabled"));
+            };
+
+            ListBox listDevices = new ListBox
+            {
+                Location = new Point(8, 70),
+                Size = new Size(cardW, 180),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.FromArgb(226, 232, 240),
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Consolas", 9F)
+            };
+
+            Action refreshList = () =>
+            {
+                listDevices.Items.Clear();
+                var devices = WhitelistManager.GetWhitelistedDevices();
+                if (devices.Count == 0)
+                {
+                    listDevices.Items.Add(Loc.T("لا توجد أجهزة مضافة في القائمة البيضاء حتى الآن.", "No authorized devices added yet."));
+                }
+                else
+                {
+                    foreach (var d in devices)
+                    {
+                        listDevices.Items.Add(string.Format("🔹 {0} [{1}] ({2})", d.Name, d.DeviceId, d.AddedDate));
+                    }
+                }
+            };
+            refreshList();
+
+            Label lblAddDesc = new Label
+            {
+                Text = Loc.T("إضافة فلاشة/جهاز جديد (اسم الجهاز أو المعرف):", "Add Device (Device Name or Hardware ID):"),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Segoe UI", 8.5F),
+                Location = new Point(8, 258),
+                Size = new Size(cardW, 18),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            TextBox txtDevName = new TextBox
+            {
+                Location = new Point(8, 278),
+                Size = new Size(cardW - 110, 26),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Segoe UI", 9.5F)
+            };
+
+            Button btnAdd = new Button
+            {
+                Text = Loc.T("➕ إضافة", "➕ Add"),
+                Location = Loc.IsArabic ? new Point(cardW - 100, 277) : new Point(cardW - 100, 277),
+                Size = new Size(100, 28),
+                BackColor = Color.FromArgb(16, 185, 129),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnAdd.FlatAppearance.BorderSize = 0;
+            btnAdd.Click += (s, e) =>
+            {
+                if (string.IsNullOrEmpty(txtDevName.Text.Trim())) return;
+                string dev = txtDevName.Text.Trim();
+                WhitelistManager.AddDevice(dev, dev);
+                txtDevName.Clear();
+                refreshList();
+            };
+
+            Button btnRemove = new Button
+            {
+                Text = Loc.T("🗑️ حذف الجهاز المحدد", "🗑️ Remove Selected"),
+                Location = Loc.IsArabic ? new Point(8, 315) : new Point(8, 315),
+                Size = new Size(220, 34),
+                BackColor = Color.FromArgb(185, 28, 28),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnRemove.FlatAppearance.BorderSize = 0;
+            btnRemove.Click += (s, e) =>
+            {
+                if (listDevices.SelectedIndex >= 0)
+                {
+                    var devices = WhitelistManager.GetWhitelistedDevices();
+                    if (listDevices.SelectedIndex < devices.Count)
+                    {
+                        WhitelistManager.RemoveDevice(devices[listDevices.SelectedIndex].DeviceId);
+                        refreshList();
+                    }
+                }
+            };
+
+            Button btnBack = new Button
+            {
+                Text = Loc.T("رجوع", "Back"),
+                Location = Loc.IsArabic ? new Point(236, 315) : new Point(236, 315),
+                Size = new Size(cardW - 236, 34),
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 9F),
+                Cursor = Cursors.Hand
+            };
+            btnBack.FlatAppearance.BorderSize = 0;
+            btnBack.Click += (s, e) => ShowControlView();
+
+            contentCard.Controls.Add(lblTitle);
+            contentCard.Controls.Add(chkEnableWhitelist);
+            contentCard.Controls.Add(listDevices);
+            contentCard.Controls.Add(lblAddDesc);
+            contentCard.Controls.Add(txtDevName);
+            contentCard.Controls.Add(btnAdd);
+            contentCard.Controls.Add(btnRemove);
+            contentCard.Controls.Add(btnBack);
+        }
+        #endregion
+
         #region View 7: شاشة تغيير كلمة السر
         private void ShowChangePasswordView()
         {
@@ -2129,15 +2435,29 @@ namespace USBPortControllerApp
                 if (eventType == DBT_DEVICEARRIVAL)
                 {
                     string time = DateTime.Now.ToString("HH:mm:ss");
-                    lblLiveIndicator.Text = Loc.T("🔌 [" + time + "] تم توصيل جهاز في منفذ USB", "🔌 [" + time + "] USB Device Plugged In");
-                    lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
-                    SecurityLogger.LogEvent("DEVICE_CONNECTED", Loc.T("تم توصيل جهاز USB جديد بالجهاز", "USB Device attached"));
+                    bool isWhitelisted = !WhitelistManager.IsWhitelistModeEnabled(); // Allowed by default if whitelist mode disabled
+
+                    if (WhitelistManager.IsWhitelistModeEnabled())
+                    {
+                        lblLiveIndicator.Text = Loc.T("🔌 [" + time + "] تم فحص الجهاز المتصل بالقائمة البيضاء", "🔌 [" + time + "] USB checked against Whitelist");
+                        lblLiveIndicator.ForeColor = Color.FromArgb(251, 191, 36);
+                        SecurityLogger.LogEvent("DEVICE_CONNECTED", Loc.T("تم توصيل جهاز USB وفحصه في القائمة البيضاء", "USB Device attached & checked in Whitelist"));
+                    }
+                    else
+                    {
+                        lblLiveIndicator.Text = Loc.T("🔌 [" + time + "] تم توصيل جهاز في منفذ USB", "🔌 [" + time + "] USB Device Plugged In");
+                        lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
+                        SecurityLogger.LogEvent("DEVICE_CONNECTED", Loc.T("تم توصيل جهاز USB جديد بالجهاز", "USB Device attached"));
+                    }
 
                     string botToken, chatId;
                     AlertNotifier.LoadTelegramConfig(out botToken, out chatId);
                     if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
                     {
-                        AlertNotifier.SendTelegramAlert(botToken, chatId, "🔌 إشعار أمني: تم توصيل جهاز USB في الجهاز: " + Environment.MachineName + " في تمام الساعة: " + time);
+                        string alertText = WhitelistManager.IsWhitelistModeEnabled()
+                            ? string.Format("⚠️ [USB Shield - تنبيه القائمة البيضاء] تم توصيل جهاز USB على {0} في تمام {1}. يرجى التحقق من أنه جهاز مصرح به.", Environment.MachineName, time)
+                            : string.Format("🔌 [USB Shield] تم توصيل جهاز USB في الجهاز {0} في تمام الساعة: {1}", Environment.MachineName, time);
+                        AlertNotifier.SendTelegramAlert(botToken, chatId, alertText);
                     }
                 }
                 else if (eventType == DBT_DEVICEREMOVECOMPLETE)
