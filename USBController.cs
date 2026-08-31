@@ -128,6 +128,25 @@ namespace USBPortControllerApp
             catch { }
         }
 
+        public static List<string> GetConnectedUsbDrives()
+        {
+            List<string> drives = new List<string>();
+            try
+            {
+                foreach (DriveInfo drive in DriveInfo.GetDrives())
+                {
+                    if (drive.DriveType == DriveType.Removable && drive.IsReady)
+                    {
+                        string label = string.IsNullOrEmpty(drive.VolumeLabel) ? Loc.T("فلاشة بدون اسم", "Unnamed USB") : drive.VolumeLabel;
+                        double sizeGb = Math.Round((double)drive.TotalSize / (1024 * 1024 * 1024), 1);
+                        drives.Add(string.Format("{0} ({1}) - {2} GB [{3}]", label, drive.Name.TrimEnd('\\'), sizeGb, drive.DriveFormat));
+                    }
+                }
+            }
+            catch { }
+            return drives;
+        }
+
         public static List<WhitelistDevice> GetWhitelistedDevices()
         {
             List<WhitelistDevice> list = new List<WhitelistDevice>();
@@ -1984,10 +2003,10 @@ namespace USBPortControllerApp
 
             Label lblTitle = new Label
             {
-                Text = Loc.T("🛡️ القائمة البيضاء (الأجهزة المصرح بها)", "🛡️ Authorized Devices Whitelist"),
+                Text = Loc.T("🛡️ القائمة البيضاء (الأجهزة والفلاشات المصرح بها)", "🛡️ Authorized Devices Whitelist"),
                 ForeColor = Color.FromArgb(96, 165, 250),
                 Font = new Font("Segoe UI", 11F, FontStyle.Bold),
-                Location = new Point(8, 10),
+                Location = new Point(8, 8),
                 Size = new Size(cardW, 24),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
@@ -1999,8 +2018,8 @@ namespace USBPortControllerApp
                 Checked = isWhitelistEnabled,
                 ForeColor = Color.FromArgb(226, 232, 240),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
-                Location = new Point(8, 38),
-                Size = new Size(cardW, 26),
+                Location = new Point(8, 34),
+                Size = new Size(cardW, 24),
                 Cursor = Cursors.Hand
             };
             chkEnableWhitelist.CheckedChanged += (s, e) =>
@@ -2011,17 +2030,94 @@ namespace USBPortControllerApp
                           chkEnableWhitelist.Checked ? "Whitelist mode enforced" : "Whitelist mode disabled"));
             };
 
+            // 1. قسم الفلاشات المتصلة حالياً بالجهاز
+            Label lblConnectedTitle = new Label
+            {
+                Text = Loc.T("🔌 الفلاشات المتصلة حالياً بالجهاز (اختر للإضافة الفورية):", "🔌 Currently Connected USB Drives (Select to Add):"),
+                ForeColor = Color.FromArgb(74, 222, 128),
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Location = new Point(8, 62),
+                Size = new Size(cardW, 18),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
+            ComboBox cmbConnectedDrives = new ComboBox
+            {
+                Location = new Point(8, 82),
+                Size = new Size(cardW - 130, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.White,
+                Font = new Font("Segoe UI", 9F)
+            };
+
+            Button btnRefreshDrives = new Button
+            {
+                Text = Loc.T("🔄 فحص", "🔄 Scan"),
+                Location = Loc.IsArabic ? new Point(cardW - 120, 81) : new Point(cardW - 120, 81),
+                Size = new Size(55, 27),
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnRefreshDrives.FlatAppearance.BorderSize = 0;
+
+            Button btnAddCurrent = new Button
+            {
+                Text = Loc.T("➕ تصريح", "➕ Allow"),
+                Location = Loc.IsArabic ? new Point(cardW - 60, 81) : new Point(cardW - 60, 81),
+                Size = new Size(60, 27),
+                BackColor = Color.FromArgb(16, 185, 129),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8F, FontStyle.Bold),
+                Cursor = Cursors.Hand
+            };
+            btnAddCurrent.FlatAppearance.BorderSize = 0;
+
+            Action refreshConnectedDrives = () =>
+            {
+                cmbConnectedDrives.Items.Clear();
+                var drives = WhitelistManager.GetConnectedUsbDrives();
+                if (drives.Count == 0)
+                {
+                    cmbConnectedDrives.Items.Add(Loc.T("لا توجد فلاشات متصلة حالياً (أدخل الفلاشه واضغط فحص)", "No USB drives connected (Insert USB & click Scan)"));
+                    cmbConnectedDrives.SelectedIndex = 0;
+                }
+                else
+                {
+                    foreach (var d in drives) cmbConnectedDrives.Items.Add(d);
+                    cmbConnectedDrives.SelectedIndex = 0;
+                }
+            };
+            refreshConnectedDrives();
+
+            btnRefreshDrives.Click += (s, e) => refreshConnectedDrives();
+
+            // 2. قائمة الأجهزة المصرح بها الحالية
+            Label lblWhitelistTitle = new Label
+            {
+                Text = Loc.T("📋 قائمة الأجهزة المصرح لها بالعمل:", "📋 Allowed Whitelist Devices:"),
+                ForeColor = Color.FromArgb(226, 232, 240),
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Location = new Point(8, 116),
+                Size = new Size(cardW, 18),
+                TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
+            };
+
             ListBox listDevices = new ListBox
             {
-                Location = new Point(8, 70),
-                Size = new Size(cardW, 180),
+                Location = new Point(8, 136),
+                Size = new Size(cardW, 175),
                 BackColor = Color.FromArgb(15, 23, 42),
                 ForeColor = Color.FromArgb(226, 232, 240),
                 BorderStyle = BorderStyle.FixedSingle,
                 Font = new Font("Consolas", 9F)
             };
 
-            Action refreshList = () =>
+            Action refreshWhitelist = () =>
             {
                 listDevices.Items.Clear();
                 var devices = WhitelistManager.GetWhitelistedDevices();
@@ -2037,21 +2133,36 @@ namespace USBPortControllerApp
                     }
                 }
             };
-            refreshList();
+            refreshWhitelist();
 
+            btnAddCurrent.Click += (s, e) =>
+            {
+                if (cmbConnectedDrives.SelectedIndex >= 0)
+                {
+                    string selected = cmbConnectedDrives.SelectedItem.ToString();
+                    if (!selected.Contains("لا توجد") && !selected.Contains("No USB"))
+                    {
+                        WhitelistManager.AddDevice(selected, selected);
+                        refreshWhitelist();
+                        MessageBox.Show(Loc.T("تمت إضافة الفلاشة بنجاح إلى القائمة البيضاء المصرح بها!", "USB drive successfully authorized!"), Loc.T("نجاح", "Success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                }
+            };
+
+            // 3. إضافة يدوية
             Label lblAddDesc = new Label
             {
-                Text = Loc.T("إضافة فلاشة/جهاز جديد (اسم الجهاز أو المعرف):", "Add Device (Device Name or Hardware ID):"),
+                Text = Loc.T("أو إضافة بالاسم يدوياً:", "Or Add Manually by Name:"),
                 ForeColor = Color.FromArgb(148, 163, 184),
                 Font = new Font("Segoe UI", 8.5F),
-                Location = new Point(8, 258),
+                Location = new Point(8, 318),
                 Size = new Size(cardW, 18),
                 TextAlign = Loc.IsArabic ? ContentAlignment.MiddleRight : ContentAlignment.MiddleLeft
             };
 
             TextBox txtDevName = new TextBox
             {
-                Location = new Point(8, 278),
+                Location = new Point(8, 338),
                 Size = new Size(cardW - 110, 26),
                 BackColor = Color.FromArgb(15, 23, 42),
                 ForeColor = Color.White,
@@ -2059,31 +2170,32 @@ namespace USBPortControllerApp
                 Font = new Font("Segoe UI", 9.5F)
             };
 
-            Button btnAdd = new Button
+            Button btnAddManual = new Button
             {
                 Text = Loc.T("➕ إضافة", "➕ Add"),
-                Location = Loc.IsArabic ? new Point(cardW - 100, 277) : new Point(cardW - 100, 277),
+                Location = Loc.IsArabic ? new Point(cardW - 100, 337) : new Point(cardW - 100, 337),
                 Size = new Size(100, 28),
-                BackColor = Color.FromArgb(16, 185, 129),
+                BackColor = Color.FromArgb(37, 99, 235),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat,
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold),
                 Cursor = Cursors.Hand
             };
-            btnAdd.FlatAppearance.BorderSize = 0;
-            btnAdd.Click += (s, e) =>
+            btnAddManual.FlatAppearance.BorderSize = 0;
+            btnAddManual.Click += (s, e) =>
             {
                 if (string.IsNullOrEmpty(txtDevName.Text.Trim())) return;
                 string dev = txtDevName.Text.Trim();
                 WhitelistManager.AddDevice(dev, dev);
                 txtDevName.Clear();
-                refreshList();
+                refreshWhitelist();
             };
 
+            // 4. أزرار التحكم
             Button btnRemove = new Button
             {
                 Text = Loc.T("🗑️ حذف الجهاز المحدد", "🗑️ Remove Selected"),
-                Location = Loc.IsArabic ? new Point(8, 315) : new Point(8, 315),
+                Location = Loc.IsArabic ? new Point(8, 375) : new Point(8, 375),
                 Size = new Size(220, 34),
                 BackColor = Color.FromArgb(185, 28, 28),
                 ForeColor = Color.White,
@@ -2100,7 +2212,7 @@ namespace USBPortControllerApp
                     if (listDevices.SelectedIndex < devices.Count)
                     {
                         WhitelistManager.RemoveDevice(devices[listDevices.SelectedIndex].DeviceId);
-                        refreshList();
+                        refreshWhitelist();
                     }
                 }
             };
@@ -2108,7 +2220,7 @@ namespace USBPortControllerApp
             Button btnBack = new Button
             {
                 Text = Loc.T("رجوع", "Back"),
-                Location = Loc.IsArabic ? new Point(236, 315) : new Point(236, 315),
+                Location = Loc.IsArabic ? new Point(236, 375) : new Point(236, 375),
                 Size = new Size(cardW - 236, 34),
                 BackColor = Color.FromArgb(51, 65, 85),
                 ForeColor = Color.White,
@@ -2121,10 +2233,15 @@ namespace USBPortControllerApp
 
             contentCard.Controls.Add(lblTitle);
             contentCard.Controls.Add(chkEnableWhitelist);
+            contentCard.Controls.Add(lblConnectedTitle);
+            contentCard.Controls.Add(cmbConnectedDrives);
+            contentCard.Controls.Add(btnRefreshDrives);
+            contentCard.Controls.Add(btnAddCurrent);
+            contentCard.Controls.Add(lblWhitelistTitle);
             contentCard.Controls.Add(listDevices);
             contentCard.Controls.Add(lblAddDesc);
             contentCard.Controls.Add(txtDevName);
-            contentCard.Controls.Add(btnAdd);
+            contentCard.Controls.Add(btnAddManual);
             contentCard.Controls.Add(btnRemove);
             contentCard.Controls.Add(btnBack);
         }
