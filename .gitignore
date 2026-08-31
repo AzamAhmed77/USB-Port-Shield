@@ -1,4 +1,6 @@
-# Ignore binary output files
+# Ignore binary compiled output
+*.exe
+*.dll
 *.obj
 *.pdb
 *.tmp
