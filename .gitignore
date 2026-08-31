@@ -1,0 +1,14 @@
+# Ignore binary output files
+*.obj
+*.pdb
+*.tmp
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+bin/
+obj/
+
+# Windows
+Thumbs.db
+Desktop.ini
