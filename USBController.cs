@@ -204,29 +204,283 @@ namespace USBPortControllerApp
     }
     #endregion
 
-    #region Webhook & Telegram Alerts Manager
+    #region Webhook & Telegram Alerts & Remote Control Manager
     public static class AlertNotifier
     {
         private const string RegKeyPath = @"Software\USBPortController\Alerts";
+        private static Thread pollingThread = null;
+        private static bool isPolling = false;
+        private static long lastUpdateId = 0;
 
-        public static void SendTelegramAlert(string botToken, string chatId, string message)
+        // Callbacks for Remote Commands
+        public static Func<bool> GetUsbStorageStateFunc;
+        public static Action<bool> SetUsbStorageStateFunc;
+        public static Func<bool> GetWriteProtectStateFunc;
+        public static Action<bool> SetWriteProtectStateFunc;
+        public static Action<int> StartAutoLockTimerFunc;
+
+        public static string GetDeviceFingerprint()
+        {
+            try
+            {
+                string hostName = Dns.GetHostName();
+                string ipAddress = "127.0.0.1";
+                try
+                {
+                    IPHostEntry entry = Dns.GetHostEntry(hostName);
+                    foreach (IPAddress ip in entry.AddressList)
+                    {
+                        if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IPAddress.IsLoopback(ip))
+                        {
+                            ipAddress = ip.ToString();
+                            break;
+                        }
+                    }
+                }
+                catch { }
+
+                return string.Format("🖥️ Device: {0} | 👤 User: {1} | 🌐 IP: {2}", Environment.MachineName, Environment.UserName, ipAddress);
+            }
+            catch
+            {
+                return string.Format("🖥️ Device: {0}", Environment.MachineName);
+            }
+        }
+
+        public static void SendTelegramAlert(string botToken, string chatId, string message, bool appendFingerprint = true)
         {
             if (string.IsNullOrEmpty(botToken) || string.IsNullOrEmpty(chatId)) return;
             new Thread(() =>
             {
                 try
                 {
+                    ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072 | SecurityProtocolType.Tls | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12;
+                    string fullMessage = message;
+                    if (appendFingerprint)
+                    {
+                        fullMessage = string.Format("{0}\n\n📌 {1}", message, GetDeviceFingerprint());
+                    }
+
                     string url = string.Format("https://api.telegram.org/bot{0}/sendMessage?chat_id={1}&text={2}",
                         Uri.EscapeDataString(botToken),
                         Uri.EscapeDataString(chatId),
-                        Uri.EscapeDataString(message));
+                        Uri.EscapeDataString(fullMessage));
                     using (WebClient client = new WebClient())
                     {
+                        client.Encoding = Encoding.UTF8;
                         client.DownloadString(url);
                     }
                 }
                 catch { }
             }).Start();
+        }
+
+        public static void StartRemoteControlListener()
+        {
+            if (isPolling) return;
+            isPolling = true;
+
+            pollingThread = new Thread(() =>
+            {
+                while (isPolling)
+                {
+                    try
+                    {
+                        string botToken, configuredChatId;
+                        LoadTelegramConfig(out botToken, out configuredChatId);
+
+                        if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(configuredChatId))
+                        {
+                            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072 | SecurityProtocolType.Tls | SecurityProtocolType.Tls11 | SecurityProtocolType.Tls12;
+                            string url = string.Format("https://api.telegram.org/bot{0}/getUpdates?offset={1}&timeout=10",
+                                Uri.EscapeDataString(botToken),
+                                lastUpdateId + 1);
+
+                            string json = "";
+                            using (WebClient client = new WebClient())
+                            {
+                                client.Encoding = Encoding.UTF8;
+                                json = client.DownloadString(url);
+                            }
+
+                            if (!string.IsNullOrEmpty(json))
+                            {
+                                ProcessTelegramUpdates(json, botToken, configuredChatId);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    Thread.Sleep(3000);
+                }
+            });
+            pollingThread.IsBackground = true;
+            pollingThread.Start();
+        }
+
+        public static void StopRemoteControlListener()
+        {
+            isPolling = false;
+            try
+            {
+                if (pollingThread != null) pollingThread.Abort();
+            }
+            catch { }
+        }
+
+        private static void ProcessTelegramUpdates(string json, string botToken, string configuredChatId)
+        {
+            try
+            {
+                int index = 0;
+                while ((index = json.IndexOf("\"update_id\":", index)) != -1)
+                {
+                    index += 12;
+                    int endUpdateId = json.IndexOfAny(new char[] { ',', '}' }, index);
+                    if (endUpdateId != -1)
+                    {
+                        string updateIdStr = json.Substring(index, endUpdateId - index).Trim();
+                        long updateId;
+                        if (long.TryParse(updateIdStr, out updateId))
+                        {
+                            if (updateId > lastUpdateId) lastUpdateId = updateId;
+                        }
+                    }
+
+                    // Look for message text in this update chunk
+                    int msgIndex = json.IndexOf("\"message\":", index);
+                    int nextUpdateIndex = json.IndexOf("\"update_id\":", index);
+                    if (msgIndex != -1 && (nextUpdateIndex == -1 || msgIndex < nextUpdateIndex))
+                    {
+                        // Check sender chatId
+                        int chatIndex = json.IndexOf("\"chat\":", msgIndex);
+                        if (chatIndex != -1)
+                        {
+                            int idIndex = json.IndexOf("\"id\":", chatIndex);
+                            if (idIndex != -1)
+                            {
+                                idIndex += 5;
+                                int endChatId = json.IndexOfAny(new char[] { ',', '}' }, idIndex);
+                                string senderChatId = json.Substring(idIndex, endChatId - idIndex).Trim();
+
+                                // Only execute commands from the authorized Admin Chat ID
+                                if (senderChatId.Equals(configuredChatId, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    int textIndex = json.IndexOf("\"text\":\"", msgIndex);
+                                    if (textIndex != -1 && (nextUpdateIndex == -1 || textIndex < nextUpdateIndex))
+                                    {
+                                        textIndex += 8;
+                                        int endText = json.IndexOf("\"", textIndex);
+                                        if (endText != -1)
+                                        {
+                                            string text = json.Substring(textIndex, endText - textIndex).Trim();
+                                            ExecuteRemoteCommand(text, botToken, configuredChatId);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void ExecuteRemoteCommand(string command, string botToken, string chatId)
+        {
+            if (string.IsNullOrEmpty(command)) return;
+            string cmd = command.Trim();
+            string myMachine = Environment.MachineName.ToUpperInvariant();
+
+            // Command syntax examples:
+            // /status or /status PCNAME
+            // /lock or /lock PCNAME
+            // /unlock or /unlock PCNAME
+            // /timer 15 or /timer PCNAME 15
+            // /help
+
+            string[] parts = cmd.Split(' ');
+            string action = parts[0].ToLowerInvariant();
+            string targetDevice = parts.Length > 1 ? parts[1].ToUpperInvariant() : "";
+
+            // Check if command is targeted to all devices or this specific device
+            if (!string.IsNullOrEmpty(targetDevice) && !targetDevice.Equals(myMachine, StringComparison.OrdinalIgnoreCase) && !action.Equals("/timer", StringComparison.OrdinalIgnoreCase))
+            {
+                // Target is specified and doesn't match this PC
+                return;
+            }
+
+            if (action == "/help" || action == "/start")
+            {
+                string helpMsg = "🛡️ *لوحة تحكم USB Port Shield عن بُعد:*\n\n" +
+                                 "🔹 `/status` - فحص حالة هذا الجهاز\n" +
+                                 "🔹 `/lock` - قفل منافذ USB فوراً\n" +
+                                 "🔹 `/unlock` - فتح منافذ USB فوراً\n" +
+                                 "🔹 `/timer 15` - فتح مؤقت لمدة (5, 15, 30, 60 دقيقة)\n" +
+                                 "🔹 `/wp_on` - تفعيل وضع الحماية من النسخ (Read-Only)\n" +
+                                 "🔹 `/wp_off` - السماح بنسخ الملفات (وضع عادي)\n" +
+                                 "\n💡 يمكنك توجيه الأمر لجهاز محدد بكتابة اسمه بعد الأمر:\nمثال: `/lock " + Environment.MachineName + "`";
+                SendTelegramAlert(botToken, chatId, helpMsg, false);
+            }
+            else if (action == "/status")
+            {
+                bool usbOpen = GetUsbStorageStateFunc != null ? GetUsbStorageStateFunc() : false;
+                bool wpActive = GetWriteProtectStateFunc != null ? GetWriteProtectStateFunc() : false;
+
+                string statusMsg = string.Format("📊 *تقرير حالة الجهاز عن بُعد:*\n\n" +
+                                                 "💾 حالة المنافذ: {0}\n" +
+                                                 "✍️ وضع القراءة فقط: {1}\n" +
+                                                 "⏱️ التوقيت: {2:yyyy-MM-dd HH:mm:ss}",
+                                                 usbOpen ? "🟢 مفتوحة ومتاحة" : "⛔ مقفلة ومحظورة",
+                                                 wpActive ? "🛡️ مفعّل (حظر النسخ)" : "✍️ معطل (النسخ مسموح)",
+                                                 DateTime.Now);
+                SendTelegramAlert(botToken, chatId, statusMsg, true);
+            }
+            else if (action == "/lock")
+            {
+                if (SetUsbStorageStateFunc != null)
+                {
+                    SetUsbStorageStateFunc(false);
+                    SendTelegramAlert(botToken, chatId, "⛔ تم تنفيذ الأمر عن بُعد: تم قفل منافذ USB بنجاح!", true);
+                }
+            }
+            else if (action == "/unlock")
+            {
+                if (SetUsbStorageStateFunc != null)
+                {
+                    SetUsbStorageStateFunc(true);
+                    SendTelegramAlert(botToken, chatId, "🟢 تم تنفيذ الأمر عن بُعد: تم فتح منافذ USB بنجاح!", true);
+                }
+            }
+            else if (action == "/wp_on")
+            {
+                if (SetWriteProtectStateFunc != null)
+                {
+                    SetWriteProtectStateFunc(true);
+                    SendTelegramAlert(botToken, chatId, "🛡️ تم تنفيذ الأمر عن بُعد: تم تفعيل وضع الحماية من النسخ (Read-Only)!", true);
+                }
+            }
+            else if (action == "/wp_off")
+            {
+                if (SetWriteProtectStateFunc != null)
+                {
+                    SetWriteProtectStateFunc(false);
+                    SendTelegramAlert(botToken, chatId, "✍️ تم تنفيذ الأمر عن بُعد: تم السماح بنسخ الملفات (Normal Mode)!", true);
+                }
+            }
+            else if (action == "/timer")
+            {
+                int mins = 15;
+                if (parts.Length > 1) int.TryParse(parts[1], out mins);
+                if (parts.Length > 2) int.TryParse(parts[2], out mins);
+                if (mins <= 0) mins = 15;
+
+                if (StartAutoLockTimerFunc != null)
+                {
+                    StartAutoLockTimerFunc(mins);
+                    SendTelegramAlert(botToken, chatId, string.Format("⏳ تم تفعيل المؤقت عن بُعد: فتح المنافذ لمدة {0} دقيقة وسيتم قفلها تلقائياً!", mins), true);
+                }
+            }
         }
 
         public static void SaveTelegramConfig(string botToken, string chatId)
@@ -543,6 +797,43 @@ namespace USBPortControllerApp
                     lblTimerStatus.ForeColor = Color.FromArgb(251, 191, 36);
                 }
             };
+
+            // Wire Remote Telegram Control Callbacks
+            AlertNotifier.GetUsbStorageStateFunc = () => IsUsbStorageEnabled();
+            AlertNotifier.SetUsbStorageStateFunc = (enable) =>
+            {
+                this.BeginInvoke((MethodInvoker)delegate
+                {
+                    SetUsbStorageEnabled(enable);
+                    RefreshAllStatus();
+                });
+            };
+            AlertNotifier.GetWriteProtectStateFunc = () => IsWriteProtectEnabled();
+            AlertNotifier.SetWriteProtectStateFunc = (enable) =>
+            {
+                this.BeginInvoke((MethodInvoker)delegate
+                {
+                    SetWriteProtectEnabled(enable);
+                    RefreshAllStatus();
+                });
+            };
+            AlertNotifier.StartAutoLockTimerFunc = (mins) =>
+            {
+                this.BeginInvoke((MethodInvoker)delegate
+                {
+                    SetUsbStorageEnabled(true);
+                    AutoLockTimerManager.StartTimer(mins, () =>
+                    {
+                        SetUsbStorageEnabled(false);
+                        RefreshAllStatus();
+                        SecurityLogger.LogEvent("AUTO_LOCK_TRIGGERED", Loc.T("انتهى وقت المؤقت وتم قفل منافذ USB تلقائياً", "Timer expired: USB ports auto-locked"));
+                    });
+                    RefreshAllStatus();
+                });
+            };
+
+            // Start Telegram Remote Polling Listener
+            AlertNotifier.StartRemoteControlListener();
 
             if (!PasswordManager.IsPasswordSet())
             {
