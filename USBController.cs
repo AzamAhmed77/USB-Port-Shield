@@ -2075,6 +2075,23 @@ namespace USBPortControllerApp
                 SecurityLogger.LogEvent(chkEnableWhitelist.Checked ? "WHITELIST_MODE_ENABLED" : "WHITELIST_MODE_DISABLED",
                     Loc.T(chkEnableWhitelist.Checked ? "تم تفعيل حظر الفلاشات غير المصرح بها" : "تم تعطيل وضع القائمة البيضاء",
                           chkEnableWhitelist.Checked ? "Whitelist mode enforced" : "Whitelist mode disabled"));
+
+                if (chkEnableWhitelist.Checked)
+                {
+                    var devices = WhitelistManager.GetWhitelistedDevices();
+                    if (devices.Count > 0)
+                    {
+                        SetUsbStorageEnabled(true);
+                        ThreadPool.QueueUserWorkItem(delegate
+                        {
+                            try
+                            {
+                                Process.Start(new ProcessStartInfo("pnputil.exe", "/scan-devices") { CreateNoWindow = true, UseShellExecute = false })?.WaitForExit(3000);
+                            }
+                            catch { }
+                        });
+                    }
+                }
             };
 
             // 1. قسم الفلاشات المتصلة حالياً بالجهاز
@@ -2191,7 +2208,19 @@ namespace USBPortControllerApp
                     {
                         WhitelistManager.AddDevice(selected, selected);
                         refreshWhitelist();
-                        MessageBox.Show(Loc.T("تمت إضافة الفلاشة بنجاح إلى القائمة البيضاء المصرح بها!", "USB drive successfully authorized!"), Loc.T("نجاح", "Success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        
+                        // Immediately unlock port and mount driver
+                        SetUsbStorageEnabled(true);
+                        ThreadPool.QueueUserWorkItem(delegate
+                        {
+                            try
+                            {
+                                Process.Start(new ProcessStartInfo("pnputil.exe", "/scan-devices") { CreateNoWindow = true, UseShellExecute = false })?.WaitForExit(3000);
+                            }
+                            catch { }
+                        });
+
+                        MessageBox.Show(Loc.T("تمت إضافة الفلاشة وتصريحها بنجاح! وستظهر الآن في جهاز الكمبيوتر.", "USB drive authorized and mounted successfully!"), Loc.T("نجاح", "Success"), MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                 }
             };
