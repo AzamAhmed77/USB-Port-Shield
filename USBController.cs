@@ -2605,22 +2605,28 @@ namespace USBPortControllerApp
                     if (WhitelistManager.IsWhitelistModeEnabled())
                     {
                         var whitelistedDevices = WhitelistManager.GetWhitelistedDevices();
-                        bool isAuthorized = whitelistedDevices.Count > 0; // If devices exist in whitelist, allow authorized access
+                        bool isAuthorized = whitelistedDevices.Count > 0; // Authorized devices exist in whitelist
 
                         if (isAuthorized)
                         {
-                            // Authorized USB Device Connected -> Unlock port to allow it to work
-                            SetUsbStorageEnabled(true);
-                            RefreshAllStatus();
-                            lblLiveIndicator.Text = Loc.T("🟢 [" + time + "] تم السماح للفلاشة المصرح بها بالعمل", "🟢 [" + time + "] Whitelisted USB allowed");
+                            // Authorized USB Device Connected -> Enable port immediately so it mounts and appears in Windows
+                            if (!IsUsbStorageEnabled())
+                            {
+                                SetUsbStorageEnabled(true);
+                                RefreshAllStatus();
+                            }
+                            lblLiveIndicator.Text = Loc.T("🟢 [" + time + "] تم السماح للفلاشة المصرح بها بالظهور والعمل", "🟢 [" + time + "] Whitelisted USB allowed & mounted");
                             lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
-                            SecurityLogger.LogEvent("WHITELIST_DEVICE_ALLOWED", Loc.T("تم السماح بتشغيل فلاشة مصرح بها من القائمة البيضاء", "Whitelisted USB device authorized & mounted"));
+                            SecurityLogger.LogEvent("WHITELIST_DEVICE_ALLOWED", Loc.T("تم السماح بتشغيل فلاشة مصرح بها حتى مع قفل المنافذ", "Whitelisted USB allowed even when ports were locked"));
                         }
                         else
                         {
-                            // Non-whitelisted device -> Block immediately
-                            SetUsbStorageEnabled(false);
-                            RefreshAllStatus();
+                            // Non-whitelisted device -> Enforce lock
+                            if (IsUsbStorageEnabled())
+                            {
+                                SetUsbStorageEnabled(false);
+                                RefreshAllStatus();
+                            }
                             lblLiveIndicator.Text = Loc.T("⛔ [" + time + "] تم حظر فلاشة غير مصرح بها فوراً", "⛔ [" + time + "] Blocked unauthorized USB");
                             lblLiveIndicator.ForeColor = Color.FromArgb(248, 113, 113);
                             SecurityLogger.LogEvent("UNAUTHORIZED_DEVICE_BLOCKED", Loc.T("تم حظر جهاز USB غير مدرج في القائمة البيضاء", "Unauthorized USB blocked by Whitelist"));
@@ -2638,7 +2644,7 @@ namespace USBPortControllerApp
                     if (!string.IsNullOrEmpty(botToken) && !string.IsNullOrEmpty(chatId))
                     {
                         string alertText = WhitelistManager.IsWhitelistModeEnabled()
-                            ? string.Format("🛡️ [USB Shield - القائمة البيضاء] تم توصيل جهاز USB على {0} في تمام {1}. حالة التصريح: مفحوص ومعتمد.", Environment.MachineName, time)
+                            ? string.Format("🛡️ [USB Shield - القائمة البيضاء] تم توصيل جهاز USB على {0} في تمام {1}. تم التحقق من التصريح والسماح به.", Environment.MachineName, time)
                             : string.Format("🔌 [USB Shield] تم توصيل جهاز USB في الجهاز {0} في تمام الساعة: {1}", Environment.MachineName, time);
                         AlertNotifier.SendTelegramAlert(botToken, chatId, alertText);
                     }
