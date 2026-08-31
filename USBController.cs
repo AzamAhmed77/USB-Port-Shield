@@ -96,89 +96,86 @@ namespace USBPortControllerApp
 
     public static class UsbHardwareManager
     {
+        // 100% In-Memory Fast Detection (0ms lag, no process spawning on UI thread)
         public static List<UsbDeviceInfo> GetActiveUsbStorageDevices()
         {
             List<UsbDeviceInfo> list = new List<UsbDeviceInfo>();
             HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // 1. Scan via pnputil for DiskDrive class
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/enum-devices /class DiskDrive")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using (Process p = Process.Start(psi))
-                {
-                    if (p != null)
-                    {
-                        string output = p.StandardOutput.ReadToEnd();
-                        p.WaitForExit(3000);
-                        ParsePnpUtilOutput(output, list, seen);
-                    }
-                }
-            }
-            catch { }
-
-            // 2. Scan via pnputil for USB class (USB Mass Storage devices)
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/enum-devices /class USB")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using (Process p = Process.Start(psi))
-                {
-                    if (p != null)
-                    {
-                        string output = p.StandardOutput.ReadToEnd();
-                        p.WaitForExit(3000);
-                        ParsePnpUtilOutput(output, list, seen);
-                    }
-                }
-            }
-            catch { }
-
-            // 3. Match with mounted DriveInfo volumes for drive letters
+            // 1. Scan mounted removable drives via DriveInfo
             try
             {
                 foreach (DriveInfo d in DriveInfo.GetDrives())
                 {
-                    if (d.DriveType == DriveType.Removable && d.IsReady)
+                    try
                     {
-                        string label = string.IsNullOrEmpty(d.VolumeLabel) ? Loc.T("فلاشة USB", "USB Flash Drive") : d.VolumeLabel;
-                        double sizeGb = Math.Round((double)d.TotalSize / (1024 * 1024 * 1024), 1);
-                        string letter = d.Name.TrimEnd('\\');
-
-                        bool matched = false;
-                        foreach (var item in list)
+                        if (d.DriveType == DriveType.Removable && d.IsReady)
                         {
-                            if (string.IsNullOrEmpty(item.DriveLetter))
-                            {
-                                item.DriveLetter = letter;
-                                item.DisplayName = string.Format("🔌 {0} ({1}) - {2} GB", item.Description, letter, sizeGb);
-                                matched = true;
-                                break;
-                            }
-                        }
+                            string label = string.IsNullOrEmpty(d.VolumeLabel) ? Loc.T("فلاشة USB", "USB Flash Drive") : d.VolumeLabel;
+                            double sizeGb = Math.Round((double)d.TotalSize / (1024 * 1024 * 1024), 1);
+                            string letter = d.Name.TrimEnd('\\');
+                            string display = string.Format("🔌 {0} ({1}) - {2} GB", label, letter, sizeGb);
 
-                        if (!matched && !seen.Contains(d.Name))
-                        {
-                            seen.Add(d.Name);
+                            seen.Add(letter);
                             list.Add(new UsbDeviceInfo
                             {
-                                InstanceId = d.Name,
+                                InstanceId = letter,
                                 Description = label,
                                 DriveLetter = letter,
-                                DisplayName = string.Format("🔌 {0} ({1}) - {2} GB", label, letter, sizeGb),
+                                DisplayName = display,
                                 Status = "Started"
                             });
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            // 2. Scan Registry for attached USB storage devices (fast in-memory registry read)
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Enum\USBSTOR"))
+                {
+                    if (key != null)
+                    {
+                        foreach (string subKeyName in key.GetSubKeyNames())
+                        {
+                            using (RegistryKey subKey = key.OpenSubKey(subKeyName))
+                            {
+                                if (subKey != null)
+                                {
+                                    foreach (string serial in subKey.GetSubKeyNames())
+                                    {
+                                        using (RegistryKey serialKey = subKey.OpenSubKey(serial))
+                                        {
+                                            if (serialKey != null)
+                                            {
+                                                string friendlyName = serialKey.GetValue("FriendlyName") as string;
+                                                string cleanName = !string.IsNullOrEmpty(friendlyName)
+                                                    ? friendlyName
+                                                    : subKeyName.Replace("Disk&Ven_", "").Replace("&Prod_", " ").Replace("&Rev_", " ");
+                                                
+                                                string shortSerial = serial.Length > 8 ? serial.Substring(0, 8) : serial;
+                                                string display = string.Format("🔌 {0} ({1})", cleanName, shortSerial);
+
+                                                if (!seen.Contains(display) && !seen.Contains(cleanName))
+                                                {
+                                                    seen.Add(display);
+                                                    list.Add(new UsbDeviceInfo
+                                                    {
+                                                        InstanceId = string.Format(@"USBSTOR\{0}\{1}", subKeyName, serial),
+                                                        Description = cleanName,
+                                                        SerialNumber = serial,
+                                                        DisplayName = display,
+                                                        Status = "Started"
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -188,144 +185,9 @@ namespace USBPortControllerApp
             return list;
         }
 
-        private static void ParsePnpUtilOutput(string output, List<UsbDeviceInfo> list, HashSet<string> seen)
-        {
-            if (string.IsNullOrEmpty(output)) return;
-            string[] lines = output.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-
-            string currentId = null;
-            string currentDesc = null;
-            string currentStatus = null;
-            string currentDriver = null;
-
-            for (int i = 0; i < lines.Length; i++)
-            {
-                string line = lines[i].Trim();
-                if (line.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase))
-                {
-                    ProcessPnpEntry(currentId, currentDesc, currentStatus, currentDriver, list, seen);
-                    currentId = line.Substring("Instance ID:".Length).Trim();
-                    currentDesc = null;
-                    currentStatus = null;
-                    currentDriver = null;
-                }
-                else if (line.StartsWith("Device Description:", StringComparison.OrdinalIgnoreCase))
-                {
-                    currentDesc = line.Substring("Device Description:".Length).Trim();
-                }
-                else if (line.StartsWith("Status:", StringComparison.OrdinalIgnoreCase))
-                {
-                    currentStatus = line.Substring("Status:".Length).Trim();
-                }
-                else if (line.StartsWith("Driver Name:", StringComparison.OrdinalIgnoreCase))
-                {
-                    currentDriver = line.Substring("Driver Name:".Length).Trim();
-                }
-            }
-            ProcessPnpEntry(currentId, currentDesc, currentStatus, currentDriver, list, seen);
-        }
-
-        private static void ProcessPnpEntry(string id, string desc, string status, string driver, List<UsbDeviceInfo> list, HashSet<string> seen)
-        {
-            if (string.IsNullOrEmpty(id)) return;
-            bool isUsbStorage = false;
-
-            if (id.StartsWith("USBSTOR", StringComparison.OrdinalIgnoreCase))
-            {
-                isUsbStorage = true;
-            }
-            else if (driver != null && driver.IndexOf("usbstor", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                isUsbStorage = true;
-            }
-            else if (desc != null && (desc.IndexOf("USB Mass Storage", StringComparison.OrdinalIgnoreCase) >= 0 || desc.IndexOf("USB Device", StringComparison.OrdinalIgnoreCase) >= 0))
-            {
-                isUsbStorage = true;
-            }
-
-            if (isUsbStorage && !seen.Contains(id))
-            {
-                seen.Add(id);
-                string cleanDesc = desc ?? "USB Storage Device";
-                string serial = "";
-                int lastSlash = id.LastIndexOf('\\');
-                if (lastSlash >= 0 && lastSlash < id.Length - 1)
-                {
-                    serial = id.Substring(lastSlash + 1).Replace("&0", "");
-                }
-
-                string shortSerial = serial.Length > 8 ? serial.Substring(0, 8) : (serial.Length > 0 ? serial : "USB");
-                list.Add(new UsbDeviceInfo
-                {
-                    InstanceId = id,
-                    Description = cleanDesc,
-                    SerialNumber = serial,
-                    Status = status ?? "Started",
-                    DisplayName = string.Format("🔌 {0} ({1})", cleanDesc, shortSerial)
-                });
-            }
-        }
-
-        public static void DisableDevice(string instanceId)
-        {
-            if (string.IsNullOrEmpty(instanceId) || instanceId.Length <= 3) return;
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", string.Format("/disable-device \"{0}\"", instanceId))
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using (Process p = Process.Start(psi))
-                {
-                    if (p != null) p.WaitForExit(3000);
-                }
-            }
-            catch { }
-        }
-
-        public static void EnableDevice(string instanceId)
-        {
-            if (string.IsNullOrEmpty(instanceId) || instanceId.Length <= 3) return;
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", string.Format("/enable-device \"{0}\"", instanceId))
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using (Process p = Process.Start(psi))
-                {
-                    if (p != null) p.WaitForExit(3000);
-                }
-            }
-            catch { }
-        }
-
-        public static void RestartDevice(string instanceId)
-        {
-            if (string.IsNullOrEmpty(instanceId) || instanceId.Length <= 3) return;
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", string.Format("/restart-device \"{0}\"", instanceId))
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using (Process p = Process.Start(psi))
-                {
-                    if (p != null) p.WaitForExit(3000);
-                }
-            }
-            catch { }
-        }
-
         public static void DisableAllUsbStorage()
         {
-            // 1. Registry: Set USBSTOR Start = 4
+            // 1. Set USBSTOR Start = 4 in Registry
             try
             {
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true))
@@ -338,17 +200,40 @@ namespace USBPortControllerApp
             }
             catch { }
 
-            // 2. Hardware: Disable all active USB storage devices immediately via pnputil
-            var devices = GetActiveUsbStorageDevices();
-            foreach (var dev in devices)
+            // 2. In background thread, dismount mounted removable volumes so they disappear immediately
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                DisableDevice(dev.InstanceId);
-            }
+                try
+                {
+                    foreach (DriveInfo d in DriveInfo.GetDrives())
+                    {
+                        if (d.DriveType == DriveType.Removable)
+                        {
+                            string letter = d.Name.TrimEnd('\\');
+                            try
+                            {
+                                ProcessStartInfo psi = new ProcessStartInfo("mountvol.exe", string.Format("{0}: /p", letter))
+                                {
+                                    CreateNoWindow = true,
+                                    UseShellExecute = false,
+                                    WindowStyle = ProcessWindowStyle.Hidden
+                                };
+                                using (Process p = Process.Start(psi))
+                                {
+                                    if (p != null) p.WaitForExit(1000);
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+            });
         }
 
         public static void EnableAllUsbStorage()
         {
-            // 1. Registry: Set USBSTOR Start = 3
+            // 1. Set USBSTOR Start = 3 in Registry
             try
             {
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true))
@@ -361,16 +246,86 @@ namespace USBPortControllerApp
             }
             catch { }
 
-            // 2. Hardware: Enable all USB storage devices and rescan
-            var devices = GetActiveUsbStorageDevices();
-            foreach (var dev in devices)
+            // 2. In background: Re-enable automount, repair any disabled PnP nodes, and rescan
+            ThreadPool.QueueUserWorkItem(delegate
             {
-                EnableDevice(dev.InstanceId);
-            }
+                try
+                {
+                    // Enable Automount
+                    ProcessStartInfo psiMount = new ProcessStartInfo("mountvol.exe", "/e")
+                    {
+                        CreateNoWindow = true,
+                        UseShellExecute = false,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    };
+                    using (Process p = Process.Start(psiMount))
+                    {
+                        if (p != null) p.WaitForExit(1000);
+                    }
 
+                    // Repair any disabled USBSTOR devices from previous sessions
+                    RepairDisabledUsbDevices();
+
+                    // Rescan devices
+                    ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/scan-devices")
+                    {
+                        CreateNoWindow = true,
+                        UseShellExecute = false,
+                        WindowStyle = ProcessWindowStyle.Hidden
+                    };
+                    using (Process p = Process.Start(psi))
+                    {
+                        if (p != null) p.WaitForExit(3000);
+                    }
+                }
+                catch { }
+            });
+        }
+
+        public static void RepairDisabledUsbDevices()
+        {
             try
             {
-                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/scan-devices")
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/enum-devices /problem")
+                {
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    if (p != null)
+                    {
+                        string output = p.StandardOutput.ReadToEnd();
+                        p.WaitForExit(3000);
+                        if (!string.IsNullOrEmpty(output))
+                        {
+                            string[] lines = output.Split(new char[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                            foreach (string line in lines)
+                            {
+                                string trim = line.Trim();
+                                if (trim.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    string id = trim.Substring("Instance ID:".Length).Trim();
+                                    if (id.IndexOf("USBSTOR", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("USB", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    {
+                                        EnableDeviceNode(id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void EnableDeviceNode(string instanceId)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", string.Format("/enable-device \"{0}\"", instanceId))
                 {
                     CreateNoWindow = true,
                     UseShellExecute = false,
@@ -378,7 +333,7 @@ namespace USBPortControllerApp
                 };
                 using (Process p = Process.Start(psi))
                 {
-                    if (p != null) p.WaitForExit(3000);
+                    if (p != null) p.WaitForExit(2000);
                 }
             }
             catch { }
@@ -391,7 +346,7 @@ namespace USBPortControllerApp
             var whitelisted = WhitelistManager.GetWhitelistedDevices();
             var connected = GetActiveUsbStorageDevices();
 
-            // Ensure USBSTOR registry is enabled so drivers can match
+            // When whitelist mode has authorized devices, keep USBSTOR enabled
             try
             {
                 using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\USBSTOR", true))
@@ -404,6 +359,7 @@ namespace USBPortControllerApp
             }
             catch { }
 
+            // Dismount any removable drive that does not match whitelist
             foreach (var dev in connected)
             {
                 bool authorized = false;
@@ -423,13 +379,22 @@ namespace USBPortControllerApp
                     }
                 }
 
-                if (authorized)
+                if (!authorized && !string.IsNullOrEmpty(dev.DriveLetter))
                 {
-                    EnableDevice(dev.InstanceId);
-                }
-                else
-                {
-                    DisableDevice(dev.InstanceId);
+                    try
+                    {
+                        ProcessStartInfo psi = new ProcessStartInfo("mountvol.exe", string.Format("{0}: /p", dev.DriveLetter))
+                        {
+                            CreateNoWindow = true,
+                            UseShellExecute = false,
+                            WindowStyle = ProcessWindowStyle.Hidden
+                        };
+                        using (Process p = Process.Start(psi))
+                        {
+                            if (p != null) p.WaitForExit(1000);
+                        }
+                    }
+                    catch { }
                 }
             }
         }
@@ -1352,6 +1317,12 @@ namespace USBPortControllerApp
 
             // Start Telegram Remote Polling Listener
             AlertNotifier.StartRemoteControlListener();
+
+            // Background Auto-Repair: ensure no USB devices remain stuck/disabled
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                UsbHardwareManager.RepairDisabledUsbDevices();
+            });
 
             if (!PasswordManager.IsPasswordSet())
             {
@@ -2836,15 +2807,20 @@ namespace USBPortControllerApp
                     {
                         key.SetValue("WriteProtect", enable ? 1 : 0, RegistryValueKind.DWord);
                         
-                        // Restart connected USB devices so write protection takes effect immediately
+                        // Trigger rescan in background so write protection policy is applied
                         ThreadPool.QueueUserWorkItem(delegate
                         {
                             try
                             {
-                                var devices = UsbHardwareManager.GetActiveUsbStorageDevices();
-                                foreach (var d in devices)
+                                ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/scan-devices")
                                 {
-                                    UsbHardwareManager.RestartDevice(d.InstanceId);
+                                    CreateNoWindow = true,
+                                    UseShellExecute = false,
+                                    WindowStyle = ProcessWindowStyle.Hidden
+                                };
+                                using (Process p = Process.Start(psi))
+                                {
+                                    if (p != null) p.WaitForExit(2000);
                                 }
                             }
                             catch { }
