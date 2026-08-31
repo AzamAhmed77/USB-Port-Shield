@@ -2609,24 +2609,38 @@ namespace USBPortControllerApp
 
                         if (isAuthorized)
                         {
-                            // Authorized USB Device Connected -> Enable port immediately so it mounts and appears in Windows
-                            if (!IsUsbStorageEnabled())
+                            // Authorized USB Device Connected -> Enable port immediately and rescan devices
+                            SetUsbStorageEnabled(true);
+                            RefreshAllStatus();
+                            
+                            // Trigger immediate PNP rescan in background so Windows mounts the drive instantly
+                            ThreadPool.QueueUserWorkItem(delegate
                             {
-                                SetUsbStorageEnabled(true);
-                                RefreshAllStatus();
-                            }
-                            lblLiveIndicator.Text = Loc.T("🟢 [" + time + "] تم السماح للفلاشة المصرح بها بالظهور والعمل", "🟢 [" + time + "] Whitelisted USB allowed & mounted");
+                                try
+                                {
+                                    ProcessStartInfo psi = new ProcessStartInfo("pnputil.exe", "/scan-devices")
+                                    {
+                                        CreateNoWindow = true,
+                                        UseShellExecute = false,
+                                        WindowStyle = ProcessWindowStyle.Hidden
+                                    };
+                                    using (Process p = Process.Start(psi))
+                                    {
+                                        if (p != null) p.WaitForExit(3000);
+                                    }
+                                }
+                                catch { }
+                            });
+
+                            lblLiveIndicator.Text = Loc.T("🟢 [" + time + "] تم تفعيل الفلاشة المصرح بها وإتاحتها فوراً", "🟢 [" + time + "] Whitelisted USB activated & mounted");
                             lblLiveIndicator.ForeColor = Color.FromArgb(74, 222, 128);
-                            SecurityLogger.LogEvent("WHITELIST_DEVICE_ALLOWED", Loc.T("تم السماح بتشغيل فلاشة مصرح بها حتى مع قفل المنافذ", "Whitelisted USB allowed even when ports were locked"));
+                            SecurityLogger.LogEvent("WHITELIST_DEVICE_ALLOWED", Loc.T("تم تنشيط وتوصيل فلاشة مصرح بها من القائمة البيضاء بنجاح", "Whitelisted USB activated and driver mounted successfully"));
                         }
                         else
                         {
                             // Non-whitelisted device -> Enforce lock
-                            if (IsUsbStorageEnabled())
-                            {
-                                SetUsbStorageEnabled(false);
-                                RefreshAllStatus();
-                            }
+                            SetUsbStorageEnabled(false);
+                            RefreshAllStatus();
                             lblLiveIndicator.Text = Loc.T("⛔ [" + time + "] تم حظر فلاشة غير مصرح بها فوراً", "⛔ [" + time + "] Blocked unauthorized USB");
                             lblLiveIndicator.ForeColor = Color.FromArgb(248, 113, 113);
                             SecurityLogger.LogEvent("UNAUTHORIZED_DEVICE_BLOCKED", Loc.T("تم حظر جهاز USB غير مدرج في القائمة البيضاء", "Unauthorized USB blocked by Whitelist"));
